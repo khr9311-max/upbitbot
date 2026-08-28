@@ -1,0 +1,27 @@
+services:
+  upbit-bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: upbit-bot:latest
+    container_name: upbit-bot
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      TZ: Asia/Seoul
+    volumes:
+      # 포지션 상태와 모의계좌는 반드시 호스트에 보존한다 (컨테이너 재생성 대비)
+      - ../data:/app/data
+      - ../logs:/app/logs
+    # 소액 계좌용 t4g.small(2GB) 에서도 여유 있게 돌도록 상한을 둔다
+    deploy:
+      resources:
+        limits:
+          memory: 1200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    stop_grace_period: 30s

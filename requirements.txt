@@ -1,0 +1,14 @@
+# 업비트 공식 SDK (시세/캔들/주문/계좌)
+upbit-sdk>=0.9.0
+
+# 설정 및 HTTP
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# 데이터 처리 / 지표 계산
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 1계층 국면 분류 (HMM). 미설치 시 규칙 기반 분류기로 자동 폴백한다.
+hmmlearn>=0.3.2
+scikit-learn>=1.3.0

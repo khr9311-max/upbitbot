@@ -1,0 +1,54 @@
+# 환경변수 / API 키 - 절대 커밋 금지
+.env
+*.env
+!.env.example
+
+# SSH / AWS 개인키 - 절대 커밋 금지
+*.pem
+*.ppk
+*.key
+id_rsa*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+
+# 봇 런타임 데이터 (포지션/모의계좌/캔들캐시/백테스트 결과)
+data/
+logs/
+*.log
+trading_history.json
+trading_history.db
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
