@@ -35,9 +35,8 @@ from strategies.base import (
     Context,
     MarketView,
 )
-from strategies.dca import SmartDcaStrategy
-from strategies.grid import AtrGridStrategy
-from strategies.trend import TrendBreakoutStrategy
+from strategies.daily_trend import DailyTrendStrategy, compute_daily_ma
+from strategies.scalp import ScalpMeanReversionStrategy
 
 log = get_logger("engine")
 
@@ -45,6 +44,16 @@ DUST_KRW = 100.0  # 이 금액 미만은 잔여 먼지로 간주
 
 
 class TradingEngine:
+    """
+    2계층 엔진: 일봉 추세(메인 자본) + 30분봉 과매도 역추세 단타(소액 레이어).
+
+    이전의 4시간봉 HMM 국면 판별 -> 그리드/DCA/변동성돌파 라우팅 구조는 실측
+    검증 결과 상승 판정에 예측력이 없어(STRONG_BULL 이후 수익률이 STRONG_BEAR
+    이후보다 낮은 경우까지 확인됨) 폐기했다. 국면 분류기(RegimeClassifier)는
+    구조적 하락 오버라이드(4시간봉 EMA200 붕괴 감지) 용도로만 남긴다 - 이
+    부분만은 실측에서 방어 효과가 뚜렷했다.
+    """
+
     def __init__(self, settings) -> None:
         self.s = settings
         self.client = UpbitClient(settings)
@@ -57,9 +66,8 @@ class TradingEngine:
         self.strategies = {
             s.name: s
             for s in (
-                TrendBreakoutStrategy(settings),
-                AtrGridStrategy(settings),
-                SmartDcaStrategy(settings),
+                DailyTrendStrategy(settings),
+                ScalpMeanReversionStrategy(settings),
             )
         }
         self._running = True
@@ -102,12 +110,15 @@ class TradingEngine:
     # 1회 사이클
     # ================================================================== #
     def run_once(self) -> None:
-        universe = self._universe()
+        trend_universe = self._trend_universe()
+        scalp_watchlist = self._scalp_watchlist(exclude=set(trend_universe))
         held = set(self.state.positions.keys())
-        markets = list(dict.fromkeys(universe + sorted(held)))
+        markets = list(dict.fromkeys(trend_universe + scalp_watchlist + sorted(held)))
         if not markets:
             log.warning("거래 가능한 마켓이 없습니다 - 다음 루프에서 재시도")
             return
+
+        trend_set, scalp_set = set(trend_universe), set(scalp_watchlist)
 
         tickers = self.client.get_tickers(markets)
         price_map = {m: t["price"] for m, t in tickers.items()}
@@ -132,15 +143,18 @@ class TradingEngine:
 
         cash = self.client.get_balances().get("KRW")
         cash_krw = cash.balance if cash else 0.0
-        active = self._active_positions()
-        ctx_slots = max(1, self.s.max_concurrent_positions)
+        active_trend, active_scalp = self._active_positions()
 
         if verdict.blocked:
             log.info("신규 진입 차단: %s", verdict.reason)
 
         for market in markets:
+            kind = self._kind_for(market, trend_set, scalp_set)
+            if kind is None:
+                continue
+
             try:
-                view = self._build_view(market, price_map.get(market, 0.0))
+                view = self._build_view(market, price_map.get(market, 0.0), kind)
             except Exception as exc:
                 log.warning("%s 시장 데이터 준비 실패: %s", market, exc)
                 continue
@@ -154,9 +168,14 @@ class TradingEngine:
 
             self._log_regime_change(market, view.regime)
 
-            strategy = self._strategy_for(view, pos)
+            strategy = self._strategy_for(pos, kind)
             if strategy is None:
                 continue
+
+            if kind == "trend":
+                alloc_pct, n_slots, active = self.s.trend_alloc_pct, max(1, self.s.trend_universe_size), active_trend
+            else:
+                alloc_pct, n_slots, active = self.s.scalp_alloc_pct, max(1, self.s.scalp_watchlist_size), active_scalp
 
             ctx = Context(
                 settings=self.s,
@@ -165,8 +184,8 @@ class TradingEngine:
                 state=self.state,
                 equity=equity,
                 cash=cash_krw,
-                regime_weight=self.regime.alloc_weight(view.regime.regime),
-                n_slots=ctx_slots,
+                regime_weight=alloc_pct,
+                n_slots=n_slots,
             )
 
             try:
@@ -179,8 +198,8 @@ class TradingEngine:
                 is_entry = action.kind in (BUY_MARKET, BUY_LIMIT)
                 if is_entry and verdict.blocked:
                     continue
-                if is_entry and market not in active and len(active) >= self.s.max_concurrent_positions:
-                    log.debug("%s 슬롯 부족 (%d/%d) - 진입 보류", market, len(active), self.s.max_concurrent_positions)
+                if is_entry and market not in active and len(active) >= n_slots:
+                    log.debug("%s 슬롯 부족 (%d/%d, %s) - 진입 보류", market, len(active), n_slots, kind)
                     continue
                 try:
                     spent = self._execute(action, view, strategy)
@@ -189,7 +208,8 @@ class TradingEngine:
                     continue
                 if spent:
                     cash_krw = max(0.0, cash_krw - spent)
-                    active = self._active_positions()
+                    active_trend, active_scalp = self._active_positions()
+                    active = active_trend if kind == "trend" else active_scalp
 
         self._cleanup_positions(price_map)
         self._heartbeat(equity, price_map)
@@ -197,54 +217,99 @@ class TradingEngine:
     # ================================================================== #
     # 시장 데이터
     # ================================================================== #
-    def _build_view(self, market: str, price: float) -> MarketView | None:
+    def _build_view(self, market: str, price: float, kind: str) -> MarketView | None:
         if price <= 0:
             return None
+        # 4시간봉은 두 전략이 공유하는 구조적 하락 오버라이드 판정용으로 항상 받는다
         macro_raw = self.client.get_candles(market, self.s.regime_timeframe, self.s.regime_candles)
-        signal_raw = self.client.get_candles(market, self.s.signal_timeframe, self.s.signal_candles)
-        if len(macro_raw) < 60 or len(signal_raw) < 60:
-            log.debug("%s 캔들 부족 (상위 %d / 실행 %d)", market, len(macro_raw), len(signal_raw))
+        if len(macro_raw) < 60:
+            log.debug("%s 4시간봉 캔들 부족 (%d개)", market, len(macro_raw))
             return None
-
         macro = build_features(macro_raw)
-        signal = build_features(signal_raw)
         regime = self.regime.classify(market, macro)
+
+        daily = None
+        signal = macro
+        if kind == "trend":
+            need = self.s.trend_ma_len + 30
+            daily_raw = self.client.get_candles(market, None, need)
+            if len(daily_raw) < self.s.trend_ma_len + 5:
+                log.debug("%s 일봉 캔들 부족 (%d/%d)", market, len(daily_raw), need)
+                return None
+            daily = compute_daily_ma(build_features(daily_raw), self.s.trend_ma_len)
+        else:  # scalp
+            signal_raw = self.client.get_candles(market, self.s.scalp_timeframe, self.s.signal_candles)
+            if len(signal_raw) < 60:
+                log.debug("%s %d분봉 캔들 부족 (%d개)", market, self.s.scalp_timeframe, len(signal_raw))
+                return None
+            signal = build_features(signal_raw)
 
         open_orders = []
         pos = self.state.positions.get(market)
         if pos is not None:
             open_orders = self.client.list_open_orders(market)
 
-        return MarketView(
-            market=market,
-            price=price,
-            regime=regime,
-            macro=macro,
-            signal=signal,
-            open_orders=open_orders,
+        kwargs = dict(
+            market=market, price=price, regime=regime, macro=macro, signal=signal,
+            open_orders=open_orders, ts=time.time(),
         )
+        if daily is not None:
+            kwargs["daily"] = daily
+        return MarketView(**kwargs)
 
-    def _strategy_for(self, view: MarketView, pos: Position | None):
-        """포지션이 있으면 그 포지션을 연 전략이, 없으면 현재 국면 담당 전략이 관리한다."""
-        if pos is not None and (pos.volume > 0 or pos.grid.get("buys")):
-            return self.strategies.get(pos.strategy)
-        for strat in self.strategies.values():
-            if strat.handles(view.regime.regime):
-                return strat
+    def _kind_for(self, market: str, trend_set: set[str], scalp_set: set[str]) -> str | None:
+        """기존 포지션이 있으면 그 포지션을 연 전략을 우선한다 (워치리스트에서 빠졌어도 관리는 계속)."""
+        pos = self.state.positions.get(market)
+        if pos is not None and pos.strategy in self.strategies:
+            return pos.strategy
+        if market in trend_set:
+            return "trend"
+        if market in scalp_set:
+            return "scalp"
         return None
 
-    def _universe(self) -> list[str]:
-        if self.state.universe_updated_at <= 0 or self.screener.is_stale(self.state.universe_updated_at):
-            keep = {m for m, p in self.state.positions.items() if p.volume > 0 or p.grid.get("buys")}
-            try:
-                self.state.universe = self.screener.select(keep)
-                self.state.universe_updated_at = time.time()
-            except Exception as exc:
-                log.warning("유니버스 갱신 실패(%s) - 기존 목록 유지", exc)
-        return list(self.state.universe)
+    def _strategy_for(self, pos: Position | None, kind: str):
+        if pos is not None and pos.strategy in self.strategies:
+            return self.strategies[pos.strategy]
+        return self.strategies.get(kind)
 
-    def _active_positions(self) -> set[str]:
-        return {m for m, p in self.state.positions.items() if p.volume > 0 or p.grid.get("buys")}
+    def _trend_universe(self) -> list[str]:
+        if not self.s.trend_enabled:
+            return []
+        st = self.state
+        if st.trend_universe_updated_at <= 0 or self.screener.is_stale(st.trend_universe_updated_at):
+            keep = {m for m, p in st.positions.items() if p.strategy == "trend" and p.volume > 0}
+            try:
+                st.trend_universe = self.screener.select(keep, size=self.s.trend_universe_size)
+                st.trend_universe_updated_at = time.time()
+            except Exception as exc:
+                log.warning("추세 유니버스 갱신 실패(%s) - 기존 목록 유지", exc)
+        return list(st.trend_universe)
+
+    def _scalp_watchlist(self, exclude: set[str]) -> list[str]:
+        if not self.s.scalp_enabled:
+            return []
+        st = self.state
+        if st.scalp_watchlist_updated_at <= 0 or self.screener.is_stale(st.scalp_watchlist_updated_at):
+            keep = {
+                m for m, p in st.positions.items()
+                if p.strategy == "scalp" and (p.volume > 0 or p.meta.get("scalp_pending_uuid"))
+            }
+            try:
+                st.scalp_watchlist = self.screener.select_scalp_watchlist(keep, exclude)
+                st.scalp_watchlist_updated_at = time.time()
+            except Exception as exc:
+                log.warning("단타 워치리스트 갱신 실패(%s) - 기존 목록 유지", exc)
+        return [m for m in st.scalp_watchlist if m not in exclude]
+
+    def _active_positions(self) -> tuple[set[str], set[str]]:
+        trend, scalp = set(), set()
+        for m, p in self.state.positions.items():
+            if p.strategy == "trend" and p.volume > 0:
+                trend.add(m)
+            elif p.strategy == "scalp" and (p.volume > 0 or p.meta.get("scalp_pending_uuid")):
+                scalp.add(m)
+        return trend, scalp
 
     # ================================================================== #
     # 액션 실행
@@ -484,6 +549,8 @@ class TradingEngine:
         """실거래 모드에서 기록된 지정가 주문의 체결/취소 여부를 확인한다."""
         tracked: list[str] = list(pos.grid.get("buys", {}).keys())
         tracked += [l["sell_uuid"] for l in pos.grid.get("lots", []) if l.get("sell_uuid")]
+        if pos.meta.get("scalp_pending_uuid"):
+            tracked.append(pos.meta["scalp_pending_uuid"])
         if not tracked:
             return
 
@@ -515,8 +582,10 @@ class TradingEngine:
         for market, pos in list(self.state.positions.items()):
             price = price_map.get(market, 0.0)
             value = pos.volume * price
-            has_orders = bool(pos.grid.get("buys")) or any(
-                l.get("sell_uuid") for l in pos.grid.get("lots", [])
+            has_orders = (
+                bool(pos.grid.get("buys"))
+                or any(l.get("sell_uuid") for l in pos.grid.get("lots", []))
+                or bool(pos.meta.get("scalp_pending_uuid"))
             )
             if value < DUST_KRW and not has_orders:
                 if pos.realized_krw:

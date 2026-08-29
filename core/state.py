@@ -107,9 +107,16 @@ class BotState:
     halt_reason: str = ""
     universe: list[str] = field(default_factory=list)
     universe_updated_at: float = 0.0
+    # 일봉 추세 엔진 / 단타 레이어가 각자 독립적으로 관리하는 유니버스
+    trend_universe: list[str] = field(default_factory=list)
+    trend_universe_updated_at: float = 0.0
+    scalp_watchlist: list[str] = field(default_factory=list)
+    scalp_watchlist_updated_at: float = 0.0
     last_heartbeat_at: float = 0.0
     started_at: float = field(default_factory=time.time)
     initial_equity: float = 0.0
+    # market -> 이 시각(epoch seconds) 전까지는 그리드 세션 재개설 금지
+    grid_cooldowns: dict[str, float] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
     # 직렬화
@@ -127,9 +134,14 @@ class BotState:
             "halt_reason": self.halt_reason,
             "universe": self.universe,
             "universe_updated_at": self.universe_updated_at,
+            "trend_universe": self.trend_universe,
+            "trend_universe_updated_at": self.trend_universe_updated_at,
+            "scalp_watchlist": self.scalp_watchlist,
+            "scalp_watchlist_updated_at": self.scalp_watchlist_updated_at,
             "last_heartbeat_at": self.last_heartbeat_at,
             "started_at": self.started_at,
             "initial_equity": self.initial_equity,
+            "grid_cooldowns": self.grid_cooldowns,
         }
 
     @classmethod
@@ -147,9 +159,14 @@ class BotState:
         st.halt_reason = raw.get("halt_reason", "")
         st.universe = list(raw.get("universe") or [])
         st.universe_updated_at = float(raw.get("universe_updated_at", 0.0))
+        st.trend_universe = list(raw.get("trend_universe") or [])
+        st.trend_universe_updated_at = float(raw.get("trend_universe_updated_at", 0.0))
+        st.scalp_watchlist = list(raw.get("scalp_watchlist") or [])
+        st.scalp_watchlist_updated_at = float(raw.get("scalp_watchlist_updated_at", 0.0))
         st.last_heartbeat_at = float(raw.get("last_heartbeat_at", 0.0))
         st.started_at = float(raw.get("started_at", time.time()))
         st.initial_equity = float(raw.get("initial_equity", 0.0))
+        st.grid_cooldowns = {k: float(v) for k, v in (raw.get("grid_cooldowns") or {}).items()}
         return st
 
     # ------------------------------------------------------------------ #

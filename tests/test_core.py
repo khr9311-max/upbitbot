@@ -29,9 +29,11 @@ from core.regime import (  # noqa: E402
 from core.sizing import PositionSizer  # noqa: E402
 from core.state import BotState, Position, Trade  # noqa: E402
 from core.upbit_client import fmt_volume, krw_tick_size, round_to_tick  # noqa: E402
-from strategies.base import MarketView  # noqa: E402
+from strategies.base import BUY_LIMIT, CANCEL, MarketView  # noqa: E402
+from strategies.daily_trend import DailyTrendStrategy, compute_daily_ma  # noqa: E402
 from strategies.dca import SmartDcaStrategy  # noqa: E402
 from strategies.grid import AtrGridStrategy  # noqa: E402
+from strategies.scalp import ScalpMeanReversionStrategy  # noqa: E402
 from strategies.trend import TrendBreakoutStrategy  # noqa: E402
 
 
@@ -399,6 +401,182 @@ def test_daily_reset_clears_halt():
     st.halt_reason = "일일 손실 한도"
     assert st.roll_day_if_needed(300_000)
     assert not st.halted and st.day_start_equity == 300_000
+
+
+# --------------------------------------------------------------------------- #
+# 일봉 추세 엔진 (daily_trend)
+# --------------------------------------------------------------------------- #
+def _daily_view(drift: float, regime_name: str = STRONG_BEAR, seed: int = 9) -> MarketView:
+    """regime_name 은 구조적 하락 오버라이드를 테스트하기 위한 값이며 실제 4시간봉과 무관하게 주입한다."""
+    from core.regime import RegimeResult
+
+    daily_raw = make_candles(150, drift=drift, vol=0.01, seed=seed)
+    daily = compute_daily_ma(build_features(daily_raw), settings.trend_ma_len)
+    macro = build_features(make_candles(300, drift=drift, vol=0.008, seed=seed))
+    return MarketView(
+        market="KRW-TEST", price=float(daily["close"].iloc[-1]),
+        regime=RegimeResult(regime_name, 0.9, "test"),
+        macro=macro, signal=macro, daily=daily,
+    )
+
+
+def test_daily_trend_enters_when_above_ma():
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name=STRONG_BULL)
+    actions = strat.plan(view, None, _Ctx())
+    assert any(a.kind == "buy_market" for a in actions), "종가가 MA 위에 있으면 진입해야 한다"
+
+
+def test_daily_trend_no_entry_below_ma():
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=-0.006, regime_name="LOW_VOL_RANGE")
+    assert strat.plan(view, None, _Ctx()) == []
+
+
+def test_daily_trend_no_entry_in_structural_bear():
+    """추세만 보면 진입 조건이어도, 구조적 하락 오버라이드가 떠 있으면 진입하면 안 된다."""
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name=STRONG_BEAR)
+    assert strat.plan(view, None, _Ctx()) == []
+
+
+def test_daily_trend_exits_on_ma_breakdown():
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=-0.006, regime_name="LOW_VOL_RANGE")
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=view.price * 1.1, invested_krw=100_000)
+    actions = strat.plan(view, pos, _Ctx())
+    assert any(a.kind == "sell_market" and a.ratio == 1.0 for a in actions)
+
+
+def test_daily_trend_exits_on_structural_bear_even_if_above_ma():
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name=STRONG_BEAR)
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=view.price * 0.9, invested_krw=100_000)
+    actions = strat.plan(view, pos, _Ctx())
+    assert any(a.kind == "sell_market" and a.ratio == 1.0 for a in actions)
+
+
+def test_daily_trend_holds_when_above_ma_no_bear():
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=view.price * 0.9, invested_krw=100_000)
+    assert strat.plan(view, pos, _Ctx()) == []
+
+
+# --------------------------------------------------------------------------- #
+# 단타 레이어 (scalp)
+# --------------------------------------------------------------------------- #
+def _scalp_view(oversold: bool, high_vol: bool, regime_name: str = "LOW_VOL_RANGE", ts: float = 1_700_000_000.0):
+    from core.regime import RegimeResult
+
+    n = 300
+    rng = np.random.default_rng(21)
+    steps = rng.normal(0.0002, 0.003, n)
+    if oversold:
+        steps[-3:] = [-0.02, -0.015, -0.01]
+    if not high_vol:
+        steps = rng.normal(0.0, 0.0005, n)  # 저변동성으로 덮어써 atr_pct 를 낮춘다
+    close = 100 * np.exp(np.cumsum(steps))
+    high, low = close * 1.002, close * 0.998
+    open_ = np.r_[close[0], close[:-1]]
+    idx = pd.date_range("2025-01-01", periods=n, freq="30min")
+    df = pd.DataFrame(
+        {"open": open_, "high": np.maximum(high, close), "low": np.minimum(low, close),
+         "close": close, "volume": rng.lognormal(3, 0.3, n), "value": rng.lognormal(10, 0.3, n)},
+        index=idx,
+    )
+    signal = build_features(df)
+    macro = build_features(make_candles(300, drift=0.0, vol=0.006, seed=4))
+    return MarketView(
+        market="KRW-TEST", price=float(signal["close"].iloc[-1]),
+        regime=RegimeResult(regime_name, 0.9, "test"),
+        macro=macro, signal=signal, ts=ts,
+    )
+
+
+def test_scalp_enters_on_oversold_high_vol():
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=True, high_vol=True)
+    actions = strat.plan(view, None, _Ctx())
+    assert any(a.kind == BUY_LIMIT for a in actions), "과매도 + 고변동성이면 지정가 진입해야 한다"
+
+
+def test_scalp_no_entry_low_volatility():
+    """전략서와 무관하게 실측: 저변동성 구간은 비용을 이길 움직임 자체가 없어 진입 금지."""
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=True, high_vol=False)
+    assert strat.plan(view, None, _Ctx()) == []
+
+
+def test_scalp_no_entry_not_oversold():
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=False, high_vol=True)
+    assert strat.plan(view, None, _Ctx()) == []
+
+
+def test_scalp_blocks_entry_in_structural_bear():
+    """실측 근거: TRUMP 처럼 급락 중 반등을 노리다 물리는 함정을 막는 필수 안전장치."""
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=True, high_vol=True, regime_name=STRONG_BEAR)
+    assert strat.plan(view, None, _Ctx()) == []
+
+
+def test_scalp_pending_entry_cancelled_after_ttl():
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=True, high_vol=True, ts=1_700_100_000.0)
+    pos = Position(market="KRW-TEST", strategy="scalp",
+                   meta={"scalp_pending_uuid": "u1", "scalp_pending_at": view.ts - settings.scalp_timeframe * 60 - 1})
+    actions = strat.plan(view, pos, _Ctx())
+    assert any(a.kind == CANCEL and a.uuid == "u1" for a in actions)
+
+
+def test_scalp_pending_entry_waits_within_ttl():
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=True, high_vol=True, ts=1_700_100_000.0)
+    pos = Position(market="KRW-TEST", strategy="scalp",
+                   meta={"scalp_pending_uuid": "u1", "scalp_pending_at": view.ts - 60})
+    assert strat.plan(view, pos, _Ctx()) == []
+
+
+def test_scalp_take_profit():
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=False, high_vol=True)
+    entry = view.price / (1 + settings.scalp_take_profit_pct * 2)  # 익절선을 확실히 넘긴 진입가
+    pos = Position(market="KRW-TEST", strategy="scalp", volume=1.0, avg_price=entry,
+                   invested_krw=entry, opened_at=view.ts)
+    actions = strat.plan(view, pos, _Ctx())
+    assert any(a.kind == "sell_market" and "익절" in a.reason for a in actions)
+
+
+def test_scalp_stop_loss():
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=False, high_vol=True)
+    entry = view.price / (1 - settings.scalp_stop_loss_pct * 2)  # 손절선을 확실히 넘긴 진입가
+    pos = Position(market="KRW-TEST", strategy="scalp", volume=1.0, avg_price=entry,
+                   invested_krw=entry, opened_at=view.ts)
+    actions = strat.plan(view, pos, _Ctx())
+    assert any(a.kind == "sell_market" and "손절" in a.reason for a in actions)
+
+
+def test_scalp_time_stop():
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=False, high_vol=True, ts=1_700_000_000.0)
+    pos = Position(market="KRW-TEST", strategy="scalp", volume=1.0, avg_price=view.price,
+                   invested_krw=view.price, opened_at=view.ts - (settings.scalp_max_hold_bars + 1) * settings.scalp_timeframe * 60)
+    actions = strat.plan(view, pos, _Ctx())
+    assert any(a.kind == "sell_market" and "타임스톱" in a.reason for a in actions)
+
+
+def test_scalp_forced_exit_on_structural_bear():
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=False, high_vol=True, regime_name=STRONG_BEAR)
+    pos = Position(market="KRW-TEST", strategy="scalp", volume=1.0, avg_price=view.price,
+                   invested_krw=view.price, opened_at=view.ts)
+    actions = strat.plan(view, pos, _Ctx())
+    assert any(a.kind == "sell_market" for a in actions)
 
 
 # --------------------------------------------------------------------------- #

@@ -50,7 +50,7 @@ EC2 콘솔 > 탄력적 IP > 탄력적 IP 주소 할당 > 인스턴스에 연결
 ## 2. 서버 초기 설정
 
 ```bash
-ssh -i ~/upbit-bot.pem ubuntu@<탄력적-IP>
+ssh -i ~/upbit-ec2.pem ubuntu@43.202.132.125
 
 # 시스템 업데이트 + 타임존
 sudo apt update && sudo apt upgrade -y

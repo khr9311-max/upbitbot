@@ -139,6 +139,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_lower"] = lower
     out["bb_width"] = width
     out["bb_pct"] = bb_width_percentile(width, 120)
+    # 변동성(ATR비율) 롤링 백분위 - 단타 레이어가 "변동성 상위 구간에서만 진입"
+    # 조건을 걸 때 쓴다. bb_pct 와 같은 순위화 헬퍼를 재사용한다.
+    out["atr_pct"] = bb_width_percentile(out["atr_ratio"], 120)
 
     adx_, plus_di, minus_di = adx(out, 14)
     out["adx"] = adx_

@@ -84,6 +84,10 @@ class Settings:
     )
     universe_refresh_hours: float = field(default_factory=lambda: _float("UNIVERSE_REFRESH_HOURS", 6))
     universe_max_spread_pct: float = field(default_factory=lambda: _float("UNIVERSE_MAX_SPREAD_PCT", 0.002))
+    # 신규 상장 코인은 상장 직후 며칠간 거래대금이 일시적으로 폭증했다가 급락하는
+    # 경우가 흔하다. 순수 거래대금 순위만 쓰면 이런 "상장빨" 코인이 상위권에 잡혀
+    # 소액 계좌가 검증되지 않은 변동성에 노출된다. 최소 경과일 미만은 제외한다.
+    universe_min_listing_days: int = field(default_factory=lambda: _int("UNIVERSE_MIN_LISTING_DAYS", 14))
 
     # ---------- 자본 / 포지션 ----------
     max_concurrent_positions: int = field(default_factory=lambda: _int("MAX_CONCURRENT_POSITIONS", 2))
@@ -108,6 +112,9 @@ class Settings:
     regime_refit_hours: float = field(default_factory=lambda: _float("REGIME_REFIT_HOURS", 24))
     regime_min_confidence: float = field(default_factory=lambda: _float("REGIME_MIN_CONFIDENCE", 0.55))
     regime_use_hmm: bool = field(default_factory=lambda: _bool("REGIME_USE_HMM", True))
+    # 국면 판정이 몇 봉 연속으로 같은 라벨을 내야 실제 전환으로 인정할지.
+    # 1이면 확인 절차 없이 매 봉 판정을 그대로 반영한다(휩소에 취약).
+    regime_confirm_bars: int = field(default_factory=lambda: _int("REGIME_CONFIRM_BARS", 2))
 
     # ---------- 2계층: 미시 실행 ----------
     signal_timeframe: int = field(default_factory=lambda: _int("SIGNAL_TIMEFRAME", 15))
@@ -136,6 +143,10 @@ class Settings:
     grid_min_spacing_pct: float = field(default_factory=lambda: _float("GRID_MIN_SPACING_PCT", 0.004))
     grid_order_ttl_min: float = field(default_factory=lambda: _float("GRID_ORDER_TTL_MIN", 180))
     grid_break_atr: float = field(default_factory=lambda: _float("GRID_BREAK_ATR", 1.5))
+    # 그리드가 청산된 직후 같은 봉/다음 봉에서 바로 재개설되는 것을 막는다. 밴드
+    # 경계가 매 세션 재계산되는데 가격이 그 경계 근처에서 오르내리면 체결 없이
+    # 청산-재개설만 반복하는 "세션 스팸"이 발생하기 때문이다.
+    grid_reopen_cooldown_min: float = field(default_factory=lambda: _float("GRID_REOPEN_COOLDOWN_MIN", 240))
 
     # ---------- 조정 국면: 한도 제어형 스마트 DCA ----------
     dca_max_steps: int = field(default_factory=lambda: _int("DCA_MAX_STEPS", 3))
@@ -150,6 +161,38 @@ class Settings:
 
     # ---------- 하락 국면 ----------
     bear_force_exit: bool = field(default_factory=lambda: _bool("BEAR_FORCE_EXIT", True))
+
+    # ---------- 일봉 추세 엔진 (메인 자본) ----------
+    # 백테스트 실측: 2.7년, 5종목 평균 - MA50 초과성과 +122%p(5/5종목 승리),
+    # MA200 -27%p(1/5종목 승리). 짧을수록 반응은 빠르지만 휩소 위험도 커지므로
+    # 50~75 구간을 기본값으로 둔다. 종목/기간에 따라 최적값이 크게 갈리므로
+    # (과적합 위험) 실거래 투입 전 별도 기간으로 반드시 재검증할 것.
+    trend_enabled: bool = field(default_factory=lambda: _bool("TREND_ENABLED", True))
+    trend_ma_len: int = field(default_factory=lambda: _int("TREND_MA_LEN", 60))
+    trend_universe_size: int = field(default_factory=lambda: _int("TREND_UNIVERSE_SIZE", 3))
+    trend_alloc_pct: float = field(default_factory=lambda: _float("TREND_ALLOC_PCT", 0.80))
+
+    # ---------- 단타 레이어 (소액 별도 자본) ----------
+    # 백테스트 실측(30분봉, 변동성 상위 30%, 지정가 가정): XRP/SUI/ONDO 의
+    # RSI 과매도·볼린저 하단 이탈 반등에서만 비용 차감 후 순양(+)이 확인됐다.
+    # 표본이 약 2주로 짧아 신뢰도가 낮으므로 SCALP_ALLOC_PCT 로 노출을 강하게 제한한다.
+    scalp_enabled: bool = field(default_factory=lambda: _bool("SCALP_ENABLED", True))
+    scalp_alloc_pct: float = field(default_factory=lambda: _float("SCALP_ALLOC_PCT", 0.15))
+    scalp_timeframe: int = field(default_factory=lambda: _int("SCALP_TIMEFRAME", 30))
+    scalp_watchlist_size: int = field(default_factory=lambda: _int("SCALP_WATCHLIST_SIZE", 3))
+    scalp_max_spread_pct: float = field(default_factory=lambda: _float("SCALP_MAX_SPREAD_PCT", 0.0015))
+    scalp_min_trade_price_24h: float = field(
+        default_factory=lambda: _float("SCALP_MIN_TRADE_PRICE_24H", 5_000_000_000)
+    )
+    scalp_rsi_max: float = field(default_factory=lambda: _float("SCALP_RSI_MAX", 30))
+    scalp_atr_percentile_min: float = field(default_factory=lambda: _float("SCALP_ATR_PERCENTILE_MIN", 0.7))
+    scalp_hold_bars: int = field(default_factory=lambda: _int("SCALP_HOLD_BARS", 1))
+    scalp_max_hold_bars: int = field(default_factory=lambda: _int("SCALP_MAX_HOLD_BARS", 4))
+    scalp_take_profit_pct: float = field(default_factory=lambda: _float("SCALP_TAKE_PROFIT_PCT", 0.006))
+    scalp_stop_loss_pct: float = field(default_factory=lambda: _float("SCALP_STOP_LOSS_PCT", 0.008))
+    scalp_watchlist_refresh_hours: float = field(
+        default_factory=lambda: _float("SCALP_WATCHLIST_REFRESH_HOURS", 6)
+    )
 
     # ---------- 운영 ----------
     telegram_bot_token: str = field(default_factory=lambda: _str("TELEGRAM_BOT_TOKEN"))

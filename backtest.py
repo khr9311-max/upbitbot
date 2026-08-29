@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import copy
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ from config import BASE_DIR, settings
 from core.indicators import build_features
 from core.logger import force_utf8, get_logger, setup_logging
 from core.regime import RegimeClassifier
+from core.screener import STABLECOINS
 from core.sizing import PositionSizer
 from core.state import BotState, Position, Trade
 from core.upbit_client import UpbitClient
@@ -51,18 +53,129 @@ CACHE_DIR = BASE_DIR / "data" / "candles"
 # --------------------------------------------------------------------------- #
 # 데이터
 # --------------------------------------------------------------------------- #
-def load_candles(client: UpbitClient, market: str, unit: int, count: int, refresh: bool) -> pd.DataFrame:
+def load_candles(client: UpbitClient, market: str, unit: int | None, count: int, refresh: bool) -> pd.DataFrame:
+    tag = f"{unit}m" if unit else "1d"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = CACHE_DIR / f"{market}_{unit}m.csv"
+    path = CACHE_DIR / f"{market}_{tag}.csv"
     if path.exists() and not refresh:
         df = pd.read_csv(path, parse_dates=["datetime"]).set_index("datetime").sort_index()
         if len(df) >= count:
             return df.tail(count)
-    log.info("%s %d분봉 %d개 수집 중 ... (업비트 API)", market, unit, count)
+    log.info("%s %s %d개 수집 중 ... (업비트 API)", market, tag, count)
     df = client.get_candles(market, unit, count, use_cache=False)
     if not df.empty:
         df.reset_index().to_csv(path, index=False)
     return df
+
+
+# --------------------------------------------------------------------------- #
+# 동적 유니버스 (실거래 봇의 자동선정을 백테스트에서 재현)
+# --------------------------------------------------------------------------- #
+def build_universe_schedule(
+    client: UpbitClient, cfg, start_ts: pd.Timestamp, end_ts: pd.Timestamp, refresh: bool
+) -> tuple[dict[pd.Timestamp, list[str]], list[str]]:
+    """
+    실거래 스크리너(core/screener.py)와 같은 필터(유의/주의/스테이블코인 제외,
+    거래대금 하한, 최소 상장 경과일)를 과거 시점에 재현해 6시간마다 유니버스를
+    갱신하는 스케줄을 만든다.
+
+    호가 스프레드 필터는 과거 호가창 이력이 없어 재현할 수 없으므로 생략한다.
+    또한 업비트 API 는 유의/주의 종목의 과거 이력을 제공하지 않으므로, 현재
+    시점의 플래그를 전체 백테스트 기간에 일괄 적용하는 근사치를 쓴다 - 즉 지금
+    유의종목인 코인은 과거에도 항상 제외되고, 그 반대는 재현하지 못한다.
+
+    반환값: (refresh_ts -> 선정 종목 리스트) 스케줄, 그리고 기간 내 한 번이라도
+    선정된 종목의 합집합(실행 캔들을 받아야 할 대상).
+    """
+    pairs = client.get_trading_pairs()
+    tickers = client.get_krw_tickers()
+    candidates = []
+    for market in tickers:
+        if not market.startswith("KRW-"):
+            continue
+        if market.split("-")[1] in STABLECOINS:
+            continue
+        info = pairs.get(market)
+        if info is None:
+            continue
+        if info["warning"] or (cfg.universe_exclude_caution and info["caution"]):
+            continue
+        candidates.append(market)
+
+    log.info(
+        "유니버스 후보 %d개 (KRW %d종목 중 유의/주의/스테이블코인 제외, 현재 시점 플래그 기준)",
+        len(candidates), sum(1 for m in tickers if m.startswith("KRW-")),
+    )
+
+    now = pd.Timestamp.now().normalize()
+    span_days = int((end_ts - start_ts).days) + max(0, (now - end_ts).days) + 10
+    daily: dict[str, pd.Series] = {}
+    for i, market in enumerate(candidates, 1):
+        df = load_candles(client, market, None, span_days, refresh)
+        if df.empty:
+            continue
+        daily[market] = df["value"]
+        if i % 50 == 0:
+            log.info("일봉 수집 진행 %d/%d", i, len(candidates))
+
+    if not daily:
+        raise SystemExit("유니버스 후보의 일봉 데이터를 하나도 받지 못했습니다.")
+
+    # 상장일 판정은 클리핑 전 원본 이력에서 첫 유효 봉 시점으로 잡는다. 클리핑된
+    # wide 로만 계산하면 실제로는 오래된 코인도 백테스트 시작 시점 근처에서는
+    # "방금 상장한 것"처럼 보여 초반 구간을 잘못 걸러내게 된다.
+    first_date = {m: s.dropna().index.min() for m, s in daily.items() if s.dropna().size > 0}
+
+    wide = pd.DataFrame(daily).sort_index()
+    wide = wide.loc[(wide.index >= start_ts - pd.Timedelta(days=3)) & (wide.index <= end_ts)]
+
+    refresh_points = pd.date_range(start_ts, end_ts, freq=f"{int(cfg.universe_refresh_hours)}h")
+    schedule: dict[pd.Timestamp, list[str]] = {}
+    skipped_new_total = 0
+    for ts in refresh_points:
+        # 룩어헤드 방지: ts 이전에 이미 마감된 일봉까지만 사용한다
+        past = wide.loc[wide.index < ts.normalize()]
+        if past.empty:
+            schedule[ts] = []
+            continue
+        latest = past.iloc[-1].dropna()
+        latest = latest[latest >= cfg.universe_min_trade_price_24h]
+        if cfg.universe_min_listing_days > 0:
+            seasoned = [
+                m for m in latest.index
+                if m in first_date and (ts.normalize() - first_date[m]).days >= cfg.universe_min_listing_days
+            ]
+            skipped_new_total += len(latest) - len(seasoned)
+            latest = latest[seasoned]
+        top = latest.sort_values(ascending=False).head(cfg.universe_size)
+        schedule[ts] = list(top.index)
+
+    if cfg.universe_min_listing_days > 0:
+        log.info("신규상장(경과 %d일 미만) 제외로 후보에서 걸러진 연인원: %d회",
+                 cfg.universe_min_listing_days, skipped_new_total)
+
+    union = sorted({m for markets in schedule.values() for m in markets})
+    log.info(
+        "유니버스 스케줄 생성 완료 | 갱신주기 %.0f시간 | 갱신횟수 %d회 | 실행 기간 중 선정된 종목 %d개: %s",
+        cfg.universe_refresh_hours, len(schedule), len(union), ", ".join(union),
+    )
+    return schedule, union
+
+
+class UniverseSchedule:
+    """시각을 넣으면 그 시점에 적용 중인 유니버스(신규 진입 허용 종목)를 돌려준다."""
+
+    def __init__(self, schedule: dict[pd.Timestamp, list[str]]) -> None:
+        self._keys = sorted(schedule)
+        self._values = {k: set(v) for k, v in schedule.items()}
+
+    def at(self, ts: pd.Timestamp) -> set[str]:
+        if not self._keys:
+            return set()
+        idx = bisect.bisect_right(self._keys, ts) - 1
+        if idx < 0:
+            idx = 0
+        return self._values[self._keys[idx]]
 
 
 # --------------------------------------------------------------------------- #
@@ -179,10 +292,16 @@ class BacktestBroker:
 # 백테스트 엔진
 # --------------------------------------------------------------------------- #
 class Backtester:
-    def __init__(self, cfg, markets: list[str], seed: float, refit_hours: float) -> None:
+    def __init__(
+        self, cfg, markets: list[str], seed: float, refit_hours: float,
+        universe_schedule: "UniverseSchedule | None" = None,
+    ) -> None:
         self.s = cfg
         self.markets = markets
         self.refit_hours = refit_hours
+        # 동적 유니버스 모드에서만 채워진다. None 이면 --markets 로 받은 종목 전체가
+        # 항상 신규 진입 가능하다 (기존 고정 유니버스 동작과 동일).
+        self.universe_schedule = universe_schedule
         self.broker = BacktestBroker(fee=cfg.fee_rate, slippage=cfg.slippage_pct, cash=seed)
         self.state = BotState()
         self.state.initial_equity = seed
@@ -255,6 +374,7 @@ class Backtester:
                     regime=regime,
                     macro=macro_slice,
                     signal=sig_slice,
+                    ts=ts.timestamp(),
                 )
                 self._step(view, ts, i, last_price)
 
@@ -271,6 +391,12 @@ class Backtester:
                 if vol > 0:
                     self._book_sell(pos, fill, vol, fee, "백테스트 종료 청산",
                                     pd.Timestamp(self.equity_curve[-1][0]))
+        if self.equity_curve:
+            # 곡선의 마지막 점은 청산 전 평가액이라 청산 수수료/슬리피지가 빠져 있다.
+            # 그대로 두면 "종료자본"(곡선 끝값)과 "실현손익 합계"(거래이력 합)가
+            # 강제청산 비용만큼 어긋나 장부 오차로 잡힌다. 청산 후 값으로 갱신한다.
+            final_ts = self.equity_curve[-1][0]
+            self.equity_curve[-1] = (final_ts, self.broker.equity(last_prices))
         if self.equity_curve:
             self._benchmark = self.buy_and_hold(data, self.equity_curve[0][0], self.equity_curve[-1][0])
         return self.report(last_prices)
@@ -303,9 +429,15 @@ class Backtester:
             log.debug("%s 전략 예외: %s", market, exc)
             return
 
+        allowed = self.universe_schedule.at(ts) if self.universe_schedule is not None else None
+
         for action in actions:
             if action.kind in (BUY_MARKET, BUY_LIMIT):
                 if market not in active and len(active) >= self.s.max_concurrent_positions:
+                    continue
+                # 실거래 스크리너처럼, 보유 중인 종목은 유니버스에서 빠져도 계속 관리하되
+                # 유니버스 밖 종목에 새 포지션을 여는 것만 막는다.
+                if allowed is not None and market not in active and market not in allowed:
                     continue
             self._apply(action, view, strategy, ts, bar_idx)
             active = {m for m, p in self.state.positions.items() if p.volume > 0 or p.grid.get("buys")}
@@ -383,7 +515,7 @@ class Backtester:
                 pos.opened_at = ts.timestamp()
                 self.state.positions[market] = pos
             if hasattr(strategy, "on_order_placed"):
-                strategy.on_order_placed(pos, action, type("O", (), {"uuid": uid})())
+                strategy.on_order_placed(pos, action, type("O", (), {"uuid": uid})(), ts=ts.timestamp())
 
     def _cancel_open_asks(self, market: str, pos: Position, strategy) -> None:
         """시장가 청산 전에 묶여 있는 지정가 매도를 전부 회수한다."""
@@ -407,7 +539,7 @@ class Backtester:
             pos.add_fill(order.price, qty, order.price * order.volume)
             pos.last_add_at = ts.timestamp()
             if strategy and hasattr(strategy, "on_buy_filled"):
-                strategy.on_buy_filled(pos, order.uuid, order.price, qty)
+                strategy.on_buy_filled(pos, order.uuid, order.price, qty, ts=ts.timestamp())
         else:
             self._book_sell(pos, order.price, qty, order.price * qty * self.s.fee_rate,
                             "그리드 지정가 익절", ts)
@@ -563,7 +695,10 @@ def print_report(rep: dict, markets: list[str]) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="업비트 자동매매 봇 워크포워드 백테스터")
-    p.add_argument("--markets", default="KRW-BTC", help="쉼표 구분 마켓 코드 (기본 KRW-BTC)")
+    p.add_argument("--markets", default="KRW-BTC",
+                   help="쉼표 구분 마켓 코드 (기본 KRW-BTC). --dynamic-universe 와 함께 쓸 수 없음")
+    p.add_argument("--dynamic-universe", action="store_true",
+                   help="실거래 봇처럼 6시간마다 거래대금 상위 종목을 자동 선정해 검증 (--markets 무시)")
     p.add_argument("--days", type=int, default=365, help="검증 기간(일)")
     p.add_argument("--seed", type=float, default=None, help="시작 자본(원). 기본값은 DRY_RUN_SEED_KRW")
     p.add_argument("--refit-hours", type=float, default=168, help="HMM 롤링 재적합 주기(시간)")
@@ -574,7 +709,6 @@ def main() -> int:
     args = p.parse_args()
 
     setup_logging(settings.log_level, None)
-    markets = [m.strip().upper() for m in args.markets.split(",") if m.strip()]
     seed = args.seed if args.seed is not None else settings.dry_run_seed_krw
 
     cfg = copy.deepcopy(settings)
@@ -582,10 +716,21 @@ def main() -> int:
         cfg.regime_use_hmm = False
 
     client = UpbitClient(settings)
-    span_days = args.days
-    if args.end:
-        # 종료일 이전 days 일을 검증하려면 오늘부터 종료일까지의 간격만큼 더 받아와야 한다
-        span_days += max(0, (pd.Timestamp.now().normalize() - pd.Timestamp(args.end)).days)
+    end_ts = pd.Timestamp(args.end) if args.end else pd.Timestamp.now()
+    start_ts = end_ts - pd.Timedelta(days=args.days)
+
+    raw_schedule = None
+    if args.dynamic_universe:
+        log.info("동적 유니버스 모드 - 거래대금 상위 %d종목을 %.0f시간마다 자동 선정합니다.",
+                 cfg.universe_size, cfg.universe_refresh_hours)
+        raw_schedule, markets = build_universe_schedule(client, cfg, start_ts, end_ts, args.refresh)
+        if not markets:
+            raise SystemExit("동적 유니버스 스케줄에서 선정된 종목이 없습니다. "
+                             "UNIVERSE_MIN_TRADE_PRICE_24H 를 낮춰보세요.")
+    else:
+        markets = [m.strip().upper() for m in args.markets.split(",") if m.strip()]
+
+    span_days = args.days + max(0, (pd.Timestamp.now().normalize() - end_ts).days)
     sig_count = int(span_days * 24 * 60 / cfg.signal_timeframe) + 250
     macro_count = int(span_days * 24 * 60 / cfg.regime_timeframe) + 250
 
@@ -598,8 +743,6 @@ def main() -> int:
             continue
         macro_f, sig_f = build_features(macro_raw), build_features(sig_raw)
         if args.end:
-            end_ts = pd.Timestamp(args.end)
-            start_ts = end_ts - pd.Timedelta(days=args.days)
             # 지표 워밍업을 위해 시작 이전 구간도 일부 남겨둔 뒤 잘라낸다
             macro_f = macro_f.loc[macro_f.index <= end_ts]
             sig_f = sig_f.loc[(sig_f.index <= end_ts) & (sig_f.index >= start_ts)]
@@ -610,11 +753,22 @@ def main() -> int:
     if not data:
         raise SystemExit("사용 가능한 마켓 데이터가 없습니다.")
 
+    universe_sched_obj = None
+    if raw_schedule is not None:
+        # 데이터 수집에 실패해 제외된 종목은 스케줄에서도 걸러낸다
+        raw_schedule = {ts: [m for m in ms if m in data] for ts, ms in raw_schedule.items()}
+        universe_sched_obj = UniverseSchedule(raw_schedule)
+
     started = time.time()
-    bt = Backtester(cfg, list(data.keys()), seed, args.refit_hours)
+    bt = Backtester(cfg, list(data.keys()), seed, args.refit_hours, universe_sched_obj)
     report = bt.run(data)
     log.info("백테스트 소요 %.1f초", time.time() - started)
-    print_report(report, list(data.keys()))
+    label = f"동적 유니버스({len(data)}종목 순환)" if args.dynamic_universe else ", ".join(data.keys())
+    print_report(report, [label])
+    if args.dynamic_universe:
+        print(f"동적 유니버스 대상 종목: {', '.join(sorted(data.keys()))}")
+        print("주의: 유의/주의종목 필터는 현재 시점 플래그를 과거 전체 기간에 일괄 적용한 근사치이며,")
+        print("      호가 스프레드 필터는 과거 이력이 없어 이 백테스트에서는 재현되지 않습니다.\n")
 
     out = BASE_DIR / "data" / "backtest_equity.csv"
     pd.DataFrame(bt.equity_curve, columns=["datetime", "equity"]).to_csv(out, index=False)

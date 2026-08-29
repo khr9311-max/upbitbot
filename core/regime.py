@@ -69,12 +69,41 @@ class RegimeClassifier:
         self.s = settings
         self._models: dict[str, _FittedModel] = {}
         self._warned_no_hmm = False
+        # 국면 확인(hysteresis) 상태 - 마켓별로 "지금까지 확정된 국면"과
+        # "확정 대기 중인 후보 국면이 몇 봉 연속으로 나왔는지"를 추적한다.
+        self._confirmed: dict[str, RegimeResult] = {}
+        self._pending: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ #
     # 공개 API
     # ------------------------------------------------------------------ #
     def classify(self, market: str, feat: pd.DataFrame) -> RegimeResult:
-        """지표가 계산된 상위 타임프레임 DataFrame 을 받아 현재 국면을 판정한다."""
+        """
+        지표가 계산된 상위 타임프레임 DataFrame 을 받아 현재 국면을 판정한다.
+
+        원시 판정(raw)에 바로 반응하지 않고 REGIME_CONFIRM_BARS 봉 연속으로 같은
+        라벨이 나와야 실제 전환으로 인정한다. 전략서 2.1절이 명시하는 "휩소에 의한
+        손실 차단"을 실제로 보장하려면 이 확인 절차가 필수적이다 - 절차가 없으면
+        HMM 판정이 인접한 봉에서 정반대 라벨(예: 강한 상승 <-> 강한 하락)로 튈 때마다
+        그리드/추세 포지션이 불필요하게 청산-재개설을 반복하게 된다.
+
+        단, 구조적 하락 오버라이드는 확인 절차를 건너뛰고 즉시 반영한다 - 실제
+        급락 국면에서 확인을 기다리다 대응이 늦어지는 것이 훨씬 위험하기 때문이다.
+        """
+        raw = self._classify_raw(market, feat)
+        confirmed = self._confirm(market, raw)
+
+        if confirmed.regime != STRONG_BEAR and self._structural_bear(feat):
+            return RegimeResult(
+                regime=STRONG_BEAR,
+                confidence=max(confirmed.confidence, 0.6),
+                source="override",
+                detail={**confirmed.detail, "overridden_from": confirmed.regime},
+            )
+        return confirmed
+
+    def _classify_raw(self, market: str, feat: pd.DataFrame) -> RegimeResult:
+        """확인 절차를 거치기 전의 원시 국면 판정 (HMM 우선, 저신뢰 시 규칙 기반)."""
         rule = self._classify_rule(feat)
 
         result = rule
@@ -89,16 +118,48 @@ class RegimeClassifier:
         elif self.s.regime_use_hmm and not self._warned_no_hmm:
             log.warning("hmmlearn 미설치 - 규칙 기반 국면 분류기로 동작합니다. (pip install hmmlearn)")
             self._warned_no_hmm = True
-
-        # 구조적 하락 오버라이드: 어떤 모델이 뭐라 하든 롱 진입을 차단한다
-        if result.regime != STRONG_BEAR and self._structural_bear(feat):
-            return RegimeResult(
-                regime=STRONG_BEAR,
-                confidence=max(result.confidence, 0.6),
-                source="override",
-                detail={**result.detail, "overridden_from": result.regime},
-            )
         return result
+
+    def _confirm(self, market: str, raw: RegimeResult) -> RegimeResult:
+        need = max(1, self.s.regime_confirm_bars)
+        confirmed = self._confirmed.get(market)
+
+        if need <= 1 or confirmed is None:
+            self._confirmed[market] = raw
+            self._pending.pop(market, None)
+            return raw
+
+        if raw.regime == confirmed.regime:
+            # 이미 확정된 국면과 같은 라벨 - 신뢰도만 최신값으로 갱신하고 대기열 초기화
+            self._pending.pop(market, None)
+            self._confirmed[market] = raw
+            return raw
+
+        pending = self._pending.get(market)
+        if pending is None or pending["regime"] != raw.regime:
+            pending = {"regime": raw.regime, "streak": 1, "result": raw}
+        else:
+            pending["streak"] += 1
+            pending["result"] = raw
+        self._pending[market] = pending
+
+        if pending["streak"] >= need:
+            self._confirmed[market] = raw
+            self._pending.pop(market, None)
+            return raw
+
+        # 아직 확인 중 - 직전 확정 국면을 유지하되 대기 중인 후보를 참고값으로 남긴다
+        return RegimeResult(
+            regime=confirmed.regime,
+            confidence=confirmed.confidence,
+            source=confirmed.source,
+            detail={
+                **confirmed.detail,
+                "pending_regime": raw.regime,
+                "pending_streak": pending["streak"],
+                "pending_need": need,
+            },
+        )
 
     def alloc_weight(self, regime: str) -> float:
         """국면별 권장 자본 배분 비중 (전략서 2장 표)."""
@@ -179,7 +240,7 @@ class RegimeClassifier:
             log.warning("%s HMM 적합 실패(%s) - 규칙 기반으로 폴백", market, exc)
             return None
 
-        labels = self._label_states(z, states, n_states)
+        labels = self._label_states(obs, states, n_states)
         log.info(
             "%s HMM 재적합 완료 | 상태수=%d | 라벨=%s",
             market,
@@ -189,10 +250,17 @@ class RegimeClassifier:
         return _FittedModel(model=model, mean=mean, std=std, state_labels=labels, fitted_at=time.time())
 
     @staticmethod
-    def _label_states(z: np.ndarray, states: np.ndarray, n_states: int) -> dict[int, str]:
+    def _label_states(obs: np.ndarray, states: np.ndarray, n_states: int) -> dict[int, str]:
         """
         각 은닉 상태의 평균 수익률과 평균 변동성으로 해석 가능한 국면 이름을 붙인다.
-        z 의 컬럼 순서는 _FEATURE_COLS 와 같으므로 0번이 로그수익률, 1번이 ATR 비율이다.
+        obs 는 원본(비표준화) 관측치이고 컬럼 순서는 _FEATURE_COLS 와 같으므로
+        0번이 로그수익률, 1번이 ATR 비율이다.
+
+        반드시 원본 스케일을 써야 한다. HMM 학습에 쓰는 z-score 는 "그 재적합
+        윈도우 자체의 평균"을 0으로 맞추므로, +200% 폭등장처럼 윈도우 평균 자체가
+        매우 높은 구간에서는 절대 수익률이 플러스인 '숨고르기' 상태조차 윈도우
+        평균보다 낮다는 이유로 z 값이 음수가 되어 STRONG_BEAR 로 오분류된다.
+        절대 로그수익률(부호가 곧 상승/하락)을 기준으로 판정해야 이 문제가 없다.
         """
         stats: dict[int, tuple[float, float]] = {}
         for st in range(n_states):
@@ -200,7 +268,7 @@ class RegimeClassifier:
             if not mask.any():
                 stats[st] = (0.0, 0.0)
                 continue
-            rows = z[mask]
+            rows = obs[mask]
             mean_ret = float(rows[:, 0].mean())
             mean_vol = float(rows[:, 1].mean()) if rows.shape[1] > 1 else 0.0
             stats[st] = (mean_ret, mean_vol)
@@ -208,9 +276,10 @@ class RegimeClassifier:
         vols = np.array([v[1] for v in stats.values()])
         vol_median = float(np.median(vols))
 
-        # 상태들을 평균 수익률 순으로 세워 상대 비교로 라벨을 붙인다.
-        # 절대 임계치를 쓰면 변동성이 낮은 구간에서 어떤 상태도 기준을 넘지 못해
-        # 상승 국면이 아예 사라지고 추세 전략이 영원히 대기하는 문제가 생긴다.
+        # 상태들을 평균 수익률 순으로 세워 후보를 정하되, 부호(절대 수익률)가
+        # 맞을 때만 상승/하락으로 확정한다. 상대 순위만 쓰면 폭등장에서도 "가장
+        # 덜 오른" 상태가 매번 하락으로 찍히는 문제가 생기고, 절대 임계치만 쓰면
+        # 저변동성 구간에서 어떤 상태도 기준을 넘지 못해 상승 국면이 사라진다.
         order = sorted(stats, key=lambda st: stats[st][0], reverse=True)
         best, worst = order[0], order[-1]
 
@@ -225,11 +294,14 @@ class RegimeClassifier:
             else:
                 labels[st] = VOLATILE_PULLBACK
 
-        # 전부 같은 라벨로 뭉치면 판별력이 없으므로 최고/최저 수익률 상태를 강제 분리
+        # 전부 같은 라벨로 뭉치면 판별력이 없으므로 최고/최저 수익률 상태를 강제 분리.
+        # 단, 이때도 부호가 맞지 않으면 억지로 반대쪽 라벨을 붙이지 않는다
+        # (폭등장에 하락 국면을 만들어내는 것을 방지).
         if len(set(labels.values())) == 1 and n_states >= 2:
-            order = sorted(stats, key=lambda s: stats[s][0])
-            labels[order[0]] = STRONG_BEAR
-            labels[order[-1]] = STRONG_BULL
+            if stats[best][0] > 0:
+                labels[best] = STRONG_BULL
+            if stats[worst][0] < 0:
+                labels[worst] = STRONG_BEAR
         return labels
 
     # ------------------------------------------------------------------ #

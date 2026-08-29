@@ -58,6 +58,10 @@ class AtrGridStrategy(Strategy):
     # 신규 그리드 개설
     # ------------------------------------------------------------------ #
     def _open_session(self, view: MarketView, ctx: Context) -> list[Action]:
+        cooldown_until = ctx.state.grid_cooldowns.get(view.market, 0.0)
+        if view.ts < cooldown_until:
+            return []
+
         spacing_pct = self.spacing_pct(view)
         levels = self._affordable_levels(view, ctx, spacing_pct)
         if levels <= 0:
@@ -76,6 +80,12 @@ class AtrGridStrategy(Strategy):
             per_level = total_krw / levels
             if per_level < self.s.min_order_krw:
                 return []
+
+        # 세션이 어떤 경로(밴드 이탈/국면 전환/가격이탈로 인한 완전취소)로 닫히든,
+        # 닫힌 직후 바로 다시 열리지 않도록 여기서 무조건 쿨다운을 건다. 개별
+        # 원인마다 쿨다운을 걸면 놓치는 경로가 생기기 쉬워, "세션 개설" 시점
+        # 하나에서만 관리하는 편이 안전하다.
+        ctx.state.grid_cooldowns[view.market] = view.ts + self.s.grid_reopen_cooldown_min * 60
 
         actions: list[Action] = []
         for i in range(1, levels + 1):
@@ -118,11 +128,11 @@ class AtrGridStrategy(Strategy):
 
         # 1) 하단 이탈 - 전량 정리 (그리드 최대 리스크 차단 지점)
         if view.price <= lower:
-            return self._liquidate(view, pos, f"밴드 하단 이탈 정리 (현재가 {view.price:,.0f} <= 하단선 {lower:,.0f})")
+            return self._liquidate(view, pos, ctx, f"밴드 하단 이탈 정리 (현재가 {view.price:,.0f} <= 하단선 {lower:,.0f})")
 
         # 2) 하락 국면 전환 - 즉시 정리 (BEAR_FORCE_EXIT=False 면 매수만 중단)
         if view.regime.regime == STRONG_BEAR and self.s.bear_force_exit:
-            return self._liquidate(view, pos, "하락 국면 전환 - 그리드 전량 정리")
+            return self._liquidate(view, pos, ctx, "하락 국면 전환 - 그리드 전량 정리")
 
         # 3) 횡보 국면 이탈 - 신규 매수만 중단하고 보유분은 매도주문으로 소진
         winding_down = view.regime.regime != LOW_VOL_RANGE
@@ -167,8 +177,11 @@ class AtrGridStrategy(Strategy):
             return actions
 
         # 6) 매수 예약 유지 - 만료되었거나 현재가에서 너무 멀어진 주문은 재배치
+        #    view.ts(엔진: 실제 시각 / 백테스터: 시뮬레이션 시각)를 써야 한다.
+        #    time.time() 을 쓰면 백테스트에서는 실제 경과시간이 항상 0에 가까워
+        #    만료 판정이 사실상 죽어버린다.
         ttl = self.s.grid_order_ttl_min * 60
-        now = time.time()
+        now = view.ts
         buys = grid.get("buys", {})
         alive_levels: set[int] = set()
         for oid, info in list(buys.items()):
@@ -211,7 +224,11 @@ class AtrGridStrategy(Strategy):
         return actions
 
     # ------------------------------------------------------------------ #
-    def _liquidate(self, view: MarketView, pos: Position, reason: str) -> list[Action]:
+    def _liquidate(self, view: MarketView, pos: Position, ctx: Context, reason: str) -> list[Action]:
+        # 청산 직후 바로 재개설되는 것을 막는다 - 밴드 경계가 매 세션 재계산되므로
+        # 가격이 경계 근처에서 오르내리면 체결 없는 청산-재개설 루프가 생길 수 있다.
+        ctx.state.grid_cooldowns[view.market] = view.ts + self.s.grid_reopen_cooldown_min * 60
+
         actions = [
             Action(CANCEL, view.market, uuid=oid, reason="그리드 정리 - 매수 예약 취소")
             for oid in list(pos.grid.get("buys", {}))
@@ -264,14 +281,14 @@ class AtrGridStrategy(Strategy):
     # ------------------------------------------------------------------ #
     # 엔진 콜백 - 그리드 장부 관리
     # ------------------------------------------------------------------ #
-    def on_order_placed(self, pos: Position, action: Action, order) -> None:
+    def on_order_placed(self, pos: Position, action: Action, order, ts: float | None = None) -> None:
         grid = pos.grid
         if action.kind == BUY_LIMIT:
             grid.setdefault("buys", {})[order.uuid] = {
                 "price": action.price,
                 "volume": action.volume,
                 "level": action.meta.get("level", 0),
-                "at": time.time(),
+                "at": ts if ts is not None else time.time(),
             }
             grid["spacing_pct"] = action.meta.get("spacing_pct", grid.get("spacing_pct"))
             grid["center"] = action.meta.get("center", grid.get("center"))
@@ -290,10 +307,15 @@ class AtrGridStrategy(Strategy):
             if lot.get("sell_uuid") == order_uuid:
                 lot["sell_uuid"] = ""
 
-    def on_buy_filled(self, pos: Position, order_uuid: str, price: float, volume: float) -> None:
+    def on_buy_filled(
+        self, pos: Position, order_uuid: str, price: float, volume: float, ts: float | None = None
+    ) -> None:
         pos.grid.get("buys", {}).pop(order_uuid, None)
         pos.grid.setdefault("lots", []).append(
-            {"id": uuidlib.uuid4().hex[:12], "price": price, "volume": volume, "sell_uuid": "", "at": time.time()}
+            {
+                "id": uuidlib.uuid4().hex[:12], "price": price, "volume": volume,
+                "sell_uuid": "", "at": ts if ts is not None else time.time(),
+            }
         )
 
     def on_sell_filled(self, pos: Position, order_uuid: str) -> None:

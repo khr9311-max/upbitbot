@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,10 +43,15 @@ class MarketView:
     market: str
     price: float
     regime: RegimeResult
-    macro: pd.DataFrame  # 상위 타임프레임(기본 4시간봉) 지표 포함
-    signal: pd.DataFrame  # 실행 타임프레임(기본 15분봉) 지표 포함
+    macro: pd.DataFrame  # 상위 타임프레임(기본 4시간봉) 지표 포함 - 구조적 하락 판정용
+    signal: pd.DataFrame  # 실행 타임프레임(그리드/DCA 는 15분봉, 단타는 30분봉) 지표 포함
+    daily: pd.DataFrame = field(default_factory=pd.DataFrame)  # 일봉 지표 - 추세 엔진 전용
     open_orders: list = field(default_factory=list)
     spread_pct: float = 0.0
+    # 현재 시각(epoch seconds). 실거래 엔진은 time.time(), 백테스터는 해당 봉의
+    # 시뮬레이션 시각을 넣는다. 쿨다운처럼 시간 기반 게이트를 두 경로에서
+    # 동일한 방식으로 계산하기 위한 공통 시계다.
+    ts: float = field(default_factory=time.time)
 
     # ---- 안전한 값 접근 헬퍼 ----
     def sig(self, column: str, default: float = float("nan")) -> float:
@@ -53,6 +59,13 @@ class MarketView:
 
     def mac(self, column: str, default: float = float("nan")) -> float:
         return _last(self.macro, column, default)
+
+    def day(self, column: str, default: float = float("nan")) -> float:
+        return _last(self.daily, column, default)
+
+    @property
+    def daily_ready(self) -> bool:
+        return len(self.daily) >= 60
 
     @property
     def atr(self) -> float:
