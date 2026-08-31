@@ -463,6 +463,36 @@ def test_daily_trend_exits_on_structural_bear_even_if_above_ma():
     assert any(a.kind == "sell_market" and a.ratio == 1.0 for a in actions)
 
 
+def test_daily_trend_holds_through_noisy_non_override_bear():
+    """
+    source 가 "override"(_structural_bear 규칙) 가 아닌 일반 HMM/규칙 STRONG_BEAR 판정은
+    노이즈로 뒤집히는 경우가 실측에서 확인됐으므로 더 이상 강제 청산을 유발하면 안 된다.
+    """
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name=STRONG_BEAR, source="hmm")
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=view.price * 0.9, invested_krw=100_000)
+    assert strat.plan(view, pos, _Ctx()) == []
+
+
+def test_daily_trend_entry_sets_protective_stop():
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name=STRONG_BULL)
+    actions = strat.plan(view, None, _Ctx())
+    buy = next(a for a in actions if a.kind == "buy_market")
+    assert 0 < buy.price < view.price, "매수 액션에 진입가보다 낮은 손절가가 실려야 한다"
+
+
+def test_daily_trend_hard_stop_forces_exit_even_above_ma():
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=view.price * 1.5, invested_krw=100_000,
+                   stop_price=view.price * 1.01)  # 현재가가 이미 손절선 아래
+    actions = strat.plan(view, pos, _Ctx())
+    assert any(a.kind == "sell_market" and a.ratio == 1.0 for a in actions)
+
+
 def test_daily_trend_holds_when_above_ma_no_bear():
     strat = DailyTrendStrategy(settings)
     view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
@@ -583,6 +613,15 @@ def test_scalp_forced_exit_on_structural_bear():
                    invested_krw=view.price, opened_at=view.ts)
     actions = strat.plan(view, pos, _Ctx())
     assert any(a.kind == "sell_market" for a in actions)
+
+
+def test_scalp_holds_through_noisy_non_override_bear():
+    strat = ScalpMeanReversionStrategy(settings)
+    view = _scalp_view(oversold=False, high_vol=True, regime_name=STRONG_BEAR, source="hmm")
+    pos = Position(market="KRW-TEST", strategy="scalp", volume=1.0, avg_price=view.price,
+                   invested_krw=view.price, opened_at=view.ts)
+    actions = strat.plan(view, pos, _Ctx())
+    assert not any(a.kind == "sell_market" and "하락" in a.reason for a in actions)
 
 
 # --------------------------------------------------------------------------- #
