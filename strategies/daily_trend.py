@@ -42,10 +42,17 @@ class DailyTrendStrategy(Strategy):
         ma = view.day(f"ma{self.s.trend_ma_len}")
         above_ma = close > ma if ma == ma else False  # NaN 방어
 
-        # 구조적 하락 오버라이드 - 일봉 신호와 무관하게 즉시 청산
-        structural_bear = view.regime.regime == STRONG_BEAR
+        # 구조적 하락 오버라이드 - 일봉 신호와 무관하게 즉시 청산.
+        # source == "override" 인 경우만 인정한다: 일반 HMM/규칙 기반 STRONG_BEAR 판정은
+        # (hysteresis 를 거쳤어도) 4시간봉 노이즈에 뒤집히는 경우가 실측에서 확인됐고,
+        # 실측에서 방어 효과가 검증된 것은 _structural_bear() 규칙(EMA200 붕괴) 하나뿐이다.
+        structural_bear = view.regime.regime == STRONG_BEAR and view.regime.source == "override"
 
         if position and position.is_open:
+            if position.stop_price > 0 and view.price <= position.stop_price:
+                return [Action(kind=SELL_MARKET, market=view.market, ratio=1.0,
+                               reason=f"일봉 추세 손절선 이탈 청산 (현재가 {view.price:,.0f} <= "
+                                      f"손절선 {position.stop_price:,.0f})")]
             if structural_bear or not above_ma:
                 reason = "구조적 하락 오버라이드" if structural_bear else f"종가 {close:,.0f} <= MA{self.s.trend_ma_len} {ma:,.0f}"
                 return [Action(kind=SELL_MARKET, market=view.market, ratio=1.0,
@@ -67,6 +74,7 @@ class DailyTrendStrategy(Strategy):
                 kind=BUY_MARKET,
                 market=view.market,
                 krw=krw,
+                price=close * (1 - stop_dist),
                 reason=f"일봉 추세 진입 (종가 {close:,.0f} > MA{self.s.trend_ma_len} {ma:,.0f}) | {reason}",
                 meta={"strategy": self.name},
             )

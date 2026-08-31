@@ -50,7 +50,7 @@ EC2 콘솔 > 탄력적 IP > 탄력적 IP 주소 할당 > 인스턴스에 연결
 ## 2. 서버 초기 설정
 
 ```bash
-ssh -i ~/upbit-ec2.pem ubuntu@43.202.132.125
+ssh -i ~/upbit-ec2-key.pem ubuntu@43.202.132.125
 
 # 시스템 업데이트 + 타임존
 sudo apt update && sudo apt upgrade -y
@@ -88,6 +88,13 @@ cd upbit-bot
 cp .env.example .env
 nano .env      # API 키 입력, DRY_RUN=True 로 두고 시작
 chmod 600 .env # 키 파일 권한 잠그기
+
+# data/ logs/ 는 .gitignore 대상이라 클론 직후에는 존재하지 않는다. 이 상태로
+# docker compose 를 올리면 Docker 가 바인드마운트 디렉터리를 root 소유로
+# 자동 생성해버려서, 컨테이너 안의 bot 유저(uid 1000)가 로그를 못 쓰고
+# PermissionError 로 죽는다. 반드시 먼저 만들고 소유권을 맞춰둘 것.
+mkdir -p data logs
+sudo chown -R 1000:1000 data logs
 
 # 이미지 빌드 + 기동
 docker compose -f deploy/docker-compose.yml up -d --build

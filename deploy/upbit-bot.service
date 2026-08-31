@@ -11,6 +11,10 @@ Description=Upbit AI Auto Trading Bot
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
+# 재시작 폭주 방지 - [Service] 가 아니라 [Unit] 소속이다 (잘못 넣으면
+# "Unknown key name" 경고만 뜨고 조용히 무시된다)
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -22,11 +26,9 @@ ExecStartPre=-/usr/bin/docker compose -f deploy/docker-compose.yml down
 ExecStart=/usr/bin/docker compose -f deploy/docker-compose.yml up --build
 ExecStop=/usr/bin/docker compose -f deploy/docker-compose.yml down
 
-# 봇이 죽어도 항상 되살린다. 단 재시작 폭주는 막는다.
+# 봇이 죽어도 항상 되살린다.
 Restart=always
 RestartSec=20
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 StandardOutput=journal
 StandardError=journal

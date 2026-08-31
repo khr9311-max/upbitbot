@@ -406,8 +406,13 @@ def test_daily_reset_clears_halt():
 # --------------------------------------------------------------------------- #
 # 일봉 추세 엔진 (daily_trend)
 # --------------------------------------------------------------------------- #
-def _daily_view(drift: float, regime_name: str = STRONG_BEAR, seed: int = 9) -> MarketView:
-    """regime_name 은 구조적 하락 오버라이드를 테스트하기 위한 값이며 실제 4시간봉과 무관하게 주입한다."""
+def _daily_view(drift: float, regime_name: str = STRONG_BEAR, seed: int = 9, source: str = "override") -> MarketView:
+    """
+    regime_name 은 구조적 하락 오버라이드를 테스트하기 위한 값이며 실제 4시간봉과 무관하게 주입한다.
+    source 는 "override"(기본값, _structural_bear 규칙에서 나온 강제 청산) 여야 STRONG_BEAR 가
+    daily_trend 의 진입 차단/강제 청산을 유발한다 - 일반 HMM/규칙 STRONG_BEAR(source="hmm"/"rule")는
+    노이즈로 확인돼 더 이상 강제 청산을 유발하지 않는다.
+    """
     from core.regime import RegimeResult
 
     daily_raw = make_candles(150, drift=drift, vol=0.01, seed=seed)
@@ -415,7 +420,7 @@ def _daily_view(drift: float, regime_name: str = STRONG_BEAR, seed: int = 9) -> 
     macro = build_features(make_candles(300, drift=drift, vol=0.008, seed=seed))
     return MarketView(
         market="KRW-TEST", price=float(daily["close"].iloc[-1]),
-        regime=RegimeResult(regime_name, 0.9, "test"),
+        regime=RegimeResult(regime_name, 0.9, source),
         macro=macro, signal=macro, daily=daily,
     )
 
@@ -469,7 +474,8 @@ def test_daily_trend_holds_when_above_ma_no_bear():
 # --------------------------------------------------------------------------- #
 # 단타 레이어 (scalp)
 # --------------------------------------------------------------------------- #
-def _scalp_view(oversold: bool, high_vol: bool, regime_name: str = "LOW_VOL_RANGE", ts: float = 1_700_000_000.0):
+def _scalp_view(oversold: bool, high_vol: bool, regime_name: str = "LOW_VOL_RANGE",
+                 ts: float = 1_700_000_000.0, source: str = "override"):
     from core.regime import RegimeResult
 
     n = 300
@@ -492,7 +498,7 @@ def _scalp_view(oversold: bool, high_vol: bool, regime_name: str = "LOW_VOL_RANG
     macro = build_features(make_candles(300, drift=0.0, vol=0.006, seed=4))
     return MarketView(
         market="KRW-TEST", price=float(signal["close"].iloc[-1]),
-        regime=RegimeResult(regime_name, 0.9, "test"),
+        regime=RegimeResult(regime_name, 0.9, source),
         macro=macro, signal=signal, ts=ts,
     )
 

@@ -117,6 +117,8 @@ class BotState:
     initial_equity: float = 0.0
     # market -> 이 시각(epoch seconds) 전까지는 그리드 세션 재개설 금지
     grid_cooldowns: dict[str, float] = field(default_factory=dict)
+    # 이미 자본 기준선에 반영한 입출금 uuid (중복 반영 방지)
+    seen_cash_flow_uuids: list[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     # 직렬화
@@ -142,6 +144,7 @@ class BotState:
             "started_at": self.started_at,
             "initial_equity": self.initial_equity,
             "grid_cooldowns": self.grid_cooldowns,
+            "seen_cash_flow_uuids": self.seen_cash_flow_uuids[-2000:],
         }
 
     @classmethod
@@ -167,6 +170,7 @@ class BotState:
         st.started_at = float(raw.get("started_at", time.time()))
         st.initial_equity = float(raw.get("initial_equity", 0.0))
         st.grid_cooldowns = {k: float(v) for k, v in (raw.get("grid_cooldowns") or {}).items()}
+        st.seen_cash_flow_uuids = list(raw.get("seen_cash_flow_uuids") or [])
         return st
 
     # ------------------------------------------------------------------ #

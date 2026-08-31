@@ -548,6 +548,39 @@ class UpbitClient:
                 total += bal.total * px
         return total
 
+    def list_krw_cash_flows(self, seen_uuids: set[str]) -> list[tuple[str, float, str]]:
+        """
+        아직 반영하지 않은 KRW 입출금 내역을 (uuid, 순증감액(+입금/-출금), 완료시각) 로 반환한다.
+
+        입출금은 매매 손익이 아니므로 자본 기준선(initial_equity/equity_hwm/day_start_equity)에
+        그대로 반영해 두지 않으면, 입금 직후 수익률이 왜곡되고 출금 직후에는 MDD 서킷브레이커가
+        오발동한다. 페이퍼 모드는 입출금이 없으므로 빈 리스트를 반환한다.
+        """
+        if self.paper is not None:
+            return []
+        flows: list[tuple[str, float, str]] = []
+        try:
+            deposits = self._call(
+                "exchange", self._client.deposits.list, currency="KRW", state="ACCEPTED", limit=100
+            )
+            for d in deposits:
+                if d.uuid in seen_uuids:
+                    continue
+                flows.append((d.uuid, float(d.amount), d.done_at or d.created_at))
+        except Exception as exc:
+            log.warning("입금 내역 조회 실패: %s", exc)
+        try:
+            withdraws = self._call(
+                "exchange", self._client.withdraws.list, currency="KRW", state="DONE", limit=100
+            )
+            for w in withdraws:
+                if w.uuid in seen_uuids:
+                    continue
+                flows.append((w.uuid, -(float(w.amount) + float(w.fee or 0.0)), w.done_at or w.created_at))
+        except Exception as exc:
+            log.warning("출금 내역 조회 실패: %s", exc)
+        return flows
+
     # ------------------------------------------------------------------ #
     # 주문
     # ------------------------------------------------------------------ #

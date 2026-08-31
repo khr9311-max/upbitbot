@@ -130,6 +130,8 @@ class TradingEngine:
         for filled in self.client.poll_paper_fills(price_map):
             self._apply_fill(filled)
 
+        self._sync_cash_flows()
+
         equity = self.client.equity(price_map)
         verdict = self.risk.evaluate(self.state, equity)
 
@@ -517,7 +519,7 @@ class TradingEngine:
         self.notifier.send(
             f"{emoji} 매도 {pos.market} [{pos.strategy}]\n"
             f"체결가 {price:,.2f} / 수량 {volume:.8f}\n"
-            f"손익 {pnl:,.0f}원 ({pnl_pct:+.2f}%)\n{reason}"
+            f"손익 {pnl:,.0f}원 ({pnl_pct * 100:+.2f}%)\n{reason}"
         )
 
     def _apply_fill(self, order) -> None:
@@ -642,6 +644,38 @@ class TradingEngine:
                 )
             self._last_regimes[market] = regime.regime
 
+    def _sync_cash_flows(self) -> None:
+        """
+        미반영 입출금을 자본 기준선에 반영한다.
+
+        입금/출금 자체를 매매 성과로 착시하면 안 되므로, initial_equity(누적수익률
+        기준), equity_hwm(MDD 서킷브레이커 기준), day_start_equity(일일 손실한도 기준)
+        을 순증감액만큼 함께 이동시켜 이후 계산이 순수 매매 손익만 반영하도록 한다.
+        """
+        seen = set(self.state.seen_cash_flow_uuids)
+        flows = self.client.list_krw_cash_flows(seen)
+        if not flows:
+            return
+
+        net = 0.0
+        for cf_uuid, amount, done_at in flows:
+            self.state.seen_cash_flow_uuids.append(cf_uuid)
+            net += amount
+            kind = "입금" if amount > 0 else "출금"
+            log.info("KRW %s 감지: %s원 (%s)", kind, f"{amount:+,.0f}", done_at)
+
+        if self.state.initial_equity > 0:
+            self.state.initial_equity += net
+        if self.state.equity_hwm > 0:
+            self.state.equity_hwm += net
+        if self.state.day_start_equity > 0:
+            self.state.day_start_equity += net
+
+        self.notifier.send(
+            f"💰 입출금 감지 - 자본 기준선 {net:+,.0f}원 조정\n"
+            f"(누적수익률/MDD/일일손익 계산에서 매매와 분리 처리됨)"
+        )
+
     def _heartbeat(self, equity: float, price_map: dict[str, float]) -> None:
         now = time.time()
         if now - self.state.last_heartbeat_at < self.s.heartbeat_minutes * 60:
@@ -652,13 +686,21 @@ class TradingEngine:
         day = self.risk.day_pnl_pct(self.state, equity) * 100
         total = (equity / self.state.initial_equity - 1.0) * 100 if self.state.initial_equity > 0 else 0.0
         kelly = self.sizer.kelly(self.state.trades)
+        trades = self.state.trades
+        wins = [t for t in trades if t.pnl_krw > 0]
+        realized = sum(t.pnl_krw for t in trades)
+        actual_win_rate = len(wins) / len(trades) * 100 if trades else 0.0
+        kelly_note = (
+            f"켈리 f* {kelly.f_star:.3f} (표본 {kelly.sample}건)"
+            if kelly.usable
+            else f"켈리 표본부족 ({kelly.sample}/{self.s.kelly_min_trades}건)"
+        )
 
         lines = [
             f"📈 상태 보고 {kst_now_str()}",
             f"평가자산 {equity:,.0f}원 (누적 {total:+.2f}%)",
             f"당일 {day:+.2f}% / 고점대비 -{dd:.2f}%",
-            f"거래 {len(self.state.trades)}건 | 승률 {kelly.win_rate * 100:.0f}% | "
-            f"손익비 {kelly.payoff_ratio:.2f} | f* {kelly.f_star:.3f}",
+            f"거래 {len(trades)}건 | 승률 {actual_win_rate:.0f}% | 실현손익 {realized:,.0f}원 | {kelly_note}",
         ]
         for market, pos in self.state.open_positions().items():
             px = price_map.get(market, 0.0)

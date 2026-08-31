@@ -106,8 +106,8 @@ class ScalpMeanReversionStrategy(Strategy):
     def _manage(self, view: MarketView, pos: Position, ctx: Context) -> list[Action]:
         price = view.price
 
-        if view.regime.regime == STRONG_BEAR:
-            return [Action(SELL_MARKET, view.market, ratio=1.0, reason="하락 국면 전환 - 단타 포지션 정리")]
+        if view.regime.regime == STRONG_BEAR and view.regime.source == "override":
+            return [Action(SELL_MARKET, view.market, ratio=1.0, reason="구조적 하락 오버라이드 - 단타 포지션 정리")]
 
         tp = pos.avg_price * (1 + self.s.scalp_take_profit_pct)
         sl = pos.avg_price * (1 - self.s.scalp_stop_loss_pct)
