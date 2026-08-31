@@ -653,8 +653,20 @@ class TradingEngine:
         을 순증감액만큼 함께 이동시켜 이후 계산이 순수 매매 손익만 반영하도록 한다.
         """
         seen = set(self.state.seen_cash_flow_uuids)
+        first_sync = not seen
         flows = self.client.list_krw_cash_flows(seen)
         if not flows:
+            return
+
+        if first_sync:
+            # 최초 동기화 - 이 시점의 initial_equity/equity_hwm 은 이미 계좌 실제
+            # 잔고(=계좌 개설 이후 모든 입출금이 녹아든 값)를 기준으로 잡혀 있으므로,
+            # 조회되는 과거 입출금 내역을 "새로 발생한 것"처럼 순증감액에 반영하면
+            # 기준선이 이중으로 틀어진다. uuid 만 기록해 앞으로의 신규 입출금부터
+            # 반영 대상으로 삼는다.
+            for cf_uuid, _amount, _done_at in flows:
+                self.state.seen_cash_flow_uuids.append(cf_uuid)
+            log.info("입출금 내역 최초 동기화 - %d건을 기준선 조정 없이 기록", len(flows))
             return
 
         net = 0.0

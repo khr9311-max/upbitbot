@@ -625,6 +625,68 @@ def test_scalp_holds_through_noisy_non_override_bear():
 
 
 # --------------------------------------------------------------------------- #
+# 입출금 자본 기준선 동기화 (_sync_cash_flows)
+# --------------------------------------------------------------------------- #
+class _FakeCashFlowClient:
+    def __init__(self, flows):
+        self._flows = flows
+
+    def list_krw_cash_flows(self, seen):
+        return [f for f in self._flows if f[0] not in seen]
+
+
+class _FakeNotifier:
+    def __init__(self):
+        self.sent: list[str] = []
+
+    def send(self, text):
+        self.sent.append(text)
+
+
+def test_sync_cash_flows_first_run_only_seeds_uuids():
+    """
+    최초 동기화 시점의 initial_equity/equity_hwm 은 이미 계좌의 실제 잔고(=과거 모든
+    입출금이 녹아든 값) 기준이므로, 조회된 과거 입출금을 다시 순증감액으로 반영하면
+    기준선이 이중으로 틀어진다 (실거래에서 이 버그로 MDD 서킷브레이커가 오발동해
+    포지션이 강제청산된 사고가 있었다). uuid만 기록하고 기준선은 그대로여야 한다.
+    """
+    from core.engine import TradingEngine
+
+    fake = type("Fake", (), {})()
+    fake.client = _FakeCashFlowClient([("u1", 100_000.0, "t1"), ("u2", -50_000.0, "t2")])
+    fake.notifier = _FakeNotifier()
+    fake.state = BotState(initial_equity=100_000.0, equity_hwm=120_000.0, day_start_equity=110_000.0)
+
+    TradingEngine._sync_cash_flows(fake)
+
+    assert fake.state.initial_equity == 100_000.0
+    assert fake.state.equity_hwm == 120_000.0
+    assert fake.state.day_start_equity == 110_000.0
+    assert set(fake.state.seen_cash_flow_uuids) == {"u1", "u2"}
+    assert fake.notifier.sent == []
+
+
+def test_sync_cash_flows_applies_only_new_flows_after_first_run():
+    from core.engine import TradingEngine
+
+    fake = type("Fake", (), {})()
+    fake.client = _FakeCashFlowClient([("u1", 100_000.0, "t1"), ("u3", 30_000.0, "t3")])
+    fake.notifier = _FakeNotifier()
+    fake.state = BotState(
+        initial_equity=100_000.0, equity_hwm=120_000.0, day_start_equity=110_000.0,
+        seen_cash_flow_uuids=["u1"],
+    )
+
+    TradingEngine._sync_cash_flows(fake)
+
+    assert fake.state.initial_equity == 130_000.0
+    assert fake.state.equity_hwm == 150_000.0
+    assert fake.state.day_start_equity == 140_000.0
+    assert set(fake.state.seen_cash_flow_uuids) == {"u1", "u3"}
+    assert len(fake.notifier.sent) == 1
+
+
+# --------------------------------------------------------------------------- #
 def _run_all() -> int:
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
