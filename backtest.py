@@ -1,12 +1,18 @@
 """
 전향적 롤링 검증(Walk-Forward Validation) 백테스터.
 
-실거래와 동일한 국면 분류기 · 전략 · 포지션 사이징 코드를 그대로 돌린다.
-차이는 주문 체결을 과거 캔들로 시뮬레이션한다는 점뿐이다.
+실거래 메인 자본 엔진(strategies.daily_trend.DailyTrendStrategy)과 동일한
+전략 · 포지션 사이징 코드를 그대로 돌린다. 차이는 주문 체결을 과거 캔들로
+시뮬레이션한다는 점뿐이다.
 
     python backtest.py --markets KRW-BTC,KRW-ETH --days 365
     python backtest.py --markets KRW-BTC --days 730 --refit-hours 168
     python backtest.py --markets KRW-SOL --days 180 --no-hmm --seed 300000
+
+단타 레이어(strategies.scalp.ScalpStrategy)는 이 백테스터가 검증하지 않는다.
+스크리너의 워치리스트 선정 기준(호가 스프레드)이 과거 이력으로 재현 불가능해
+"그때 어떤 종목이 선정됐을지"부터 흉내낼 수 없기 때문이다 - 잘못 재현한
+워치리스트로 얻은 성과는 사이징/손절 로직을 검증했다는 착시만 준다.
 
 전략서 6장: 실자본 투입 전 최소 1~2년치 데이터로 워크포워드 검증을 거치고,
 이후 2~4주 이상 DRY_RUN 실시간 검증을 병행할 것.
@@ -40,9 +46,7 @@ from strategies.base import (
     Context,
     MarketView,
 )
-from strategies.dca import SmartDcaStrategy
-from strategies.grid import AtrGridStrategy
-from strategies.trend import TrendBreakoutStrategy
+from strategies.daily_trend import DailyTrendStrategy, compute_daily_ma
 
 force_utf8()
 log = get_logger("backtest")
@@ -308,10 +312,8 @@ class Backtester:
         self.state.equity_hwm = seed
         self.sizer = PositionSizer(cfg)
         self.clf = RegimeClassifier(cfg)
-        self.strategies = {
-            s.name: s
-            for s in (TrendBreakoutStrategy(cfg), AtrGridStrategy(cfg), SmartDcaStrategy(cfg))
-        }
+        # 백테스트는 daily_trend(메인 자본 엔진) 하나만 돌린다 - 상단 docstring 참고
+        self.strategies = {"trend": DailyTrendStrategy(cfg)}
         self.equity_curve: list[tuple[pd.Timestamp, float]] = []
         self.regime_bars: dict[str, int] = {}
         self._last_refit_bar: dict[str, int] = {}
@@ -322,7 +324,7 @@ class Backtester:
     # ------------------------------------------------------------------ #
     def run(self, data: dict[str, tuple[pd.DataFrame, pd.DataFrame]]) -> dict:
         # 모든 종목의 15분봉 인덱스를 합쳐 공통 타임라인을 만든다
-        timeline = sorted(set().union(*[set(sig.index) for _, sig in data.values()]))
+        timeline = sorted(set().union(*[set(sig.index) for _, sig, _ in data.values()]))
         warmup = 220  # 지표 워밍업 구간
         if len(timeline) <= warmup:
             raise SystemExit("백테스트에 필요한 캔들이 부족합니다. --days 를 늘리세요.")
@@ -336,7 +338,7 @@ class Backtester:
 
             price_map: dict[str, float] = {}
             for market in self.markets:
-                macro, sig = data[market]
+                macro, sig, daily = data[market]
                 if ts not in sig.index:
                     continue
                 j = sig.index.get_loc(ts)
@@ -353,6 +355,11 @@ class Backtester:
                     continue
                 macro_slice = macro.iloc[: k + 1]
                 sig_slice = sig.iloc[: j + 1]
+
+                # 일봉도 상위 타임프레임과 같은 방식으로 룩어헤드를 차단한다:
+                # ts 시점에 이미 마감된 일봉까지만 노출한다
+                dk = daily.index.searchsorted(ts, side="right") - 1
+                daily_slice = daily.iloc[: dk + 1] if dk >= 0 else daily.iloc[:0]
 
                 # 3) 워크포워드 재적합
                 if i - self._last_refit_bar.get(market, -10**9) >= refit_bars:
@@ -374,6 +381,7 @@ class Backtester:
                     regime=regime,
                     macro=macro_slice,
                     signal=sig_slice,
+                    daily=daily_slice,
                     ts=ts.timestamp(),
                 )
                 self._step(view, ts, i, last_price)
@@ -419,8 +427,10 @@ class Backtester:
             state=self.state,
             equity=equity,
             cash=self.broker.cash,
-            regime_weight=self.clf.alloc_weight(view.regime.regime),
-            n_slots=max(1, self.s.max_concurrent_positions),
+            # daily_trend 은 국면이 아니라 추세 유니버스 소속으로 라우팅되므로
+            # 실거래 engine.py 의 kind=="trend" 분기와 동일한 배분/슬롯 설정을 쓴다
+            regime_weight=self.s.trend_alloc_pct,
+            n_slots=max(1, self.s.trend_universe_size),
         )
 
         try:
@@ -564,10 +574,10 @@ class Backtester:
     def _strategy_for(self, view: MarketView, pos: Position | None):
         if pos is not None and (pos.volume > 0 or pos.grid.get("buys")):
             return self.strategies.get(pos.strategy)
-        for strat in self.strategies.values():
-            if strat.handles(view.regime.regime):
-                return strat
-        return None
+        # daily_trend 은 실거래에서도 국면 분류기가 아니라 "추세 유니버스 소속 여부"로
+        # 직접 라우팅된다(daily_trend.py 의 regimes=() 주석 참고) - 신규 진입 허용 여부는
+        # _step() 의 allowed/active 체크(동적 유니버스 스케줄)가 별도로 담당한다
+        return self.strategies.get("trend")
 
     # ------------------------------------------------------------------ #
     def buy_and_hold(self, data: dict, start_ts, end_ts) -> dict[str, float]:
@@ -578,7 +588,7 @@ class Backtester:
         상승장에서 -5% 는 실패다. 절대 수익률만 보면 둘을 구분할 수 없다.
         """
         rets, mdds = [], []
-        for _, sig in data.values():
+        for _, sig, _ in data.values():
             window = sig.loc[(sig.index >= start_ts) & (sig.index <= end_ts), "close"]
             if len(window) < 2:
                 continue
@@ -733,23 +743,28 @@ def main() -> int:
     span_days = args.days + max(0, (pd.Timestamp.now().normalize() - end_ts).days)
     sig_count = int(span_days * 24 * 60 / cfg.signal_timeframe) + 250
     macro_count = int(span_days * 24 * 60 / cfg.regime_timeframe) + 250
+    daily_count = span_days + cfg.trend_ma_len + 60  # MA 워밍업 + 여유분
 
-    data: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+    data: dict[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
     for m in markets:
         macro_raw = load_candles(client, m, cfg.regime_timeframe, macro_count, args.refresh)
         sig_raw = load_candles(client, m, cfg.signal_timeframe, sig_count, args.refresh)
-        if len(macro_raw) < 100 or len(sig_raw) < 300:
-            log.error("%s 캔들 부족 (상위 %d / 실행 %d) - 제외", m, len(macro_raw), len(sig_raw))
+        daily_raw = load_candles(client, m, None, daily_count, args.refresh)
+        if len(macro_raw) < 100 or len(sig_raw) < 300 or len(daily_raw) < cfg.trend_ma_len + 30:
+            log.error("%s 캔들 부족 (상위 %d / 실행 %d / 일봉 %d) - 제외",
+                     m, len(macro_raw), len(sig_raw), len(daily_raw))
             continue
         macro_f, sig_f = build_features(macro_raw), build_features(sig_raw)
+        daily_f = compute_daily_ma(build_features(daily_raw), cfg.trend_ma_len)
         if args.end:
             # 지표 워밍업을 위해 시작 이전 구간도 일부 남겨둔 뒤 잘라낸다
             macro_f = macro_f.loc[macro_f.index <= end_ts]
+            daily_f = daily_f.loc[daily_f.index <= end_ts]
             sig_f = sig_f.loc[(sig_f.index <= end_ts) & (sig_f.index >= start_ts)]
             if len(sig_f) < 400:
                 log.error("%s 지정 구간(%s 이전 %d일) 캔들 부족 - 제외", m, args.end, args.days)
                 continue
-        data[m] = (macro_f, sig_f)
+        data[m] = (macro_f, sig_f, daily_f)
     if not data:
         raise SystemExit("사용 가능한 마켓 데이터가 없습니다.")
 
