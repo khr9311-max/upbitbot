@@ -472,7 +472,8 @@ def test_daily_trend_holds_through_noisy_non_override_bear():
     view = _daily_view(drift=0.006, regime_name=STRONG_BEAR, source="hmm")
     pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
                    avg_price=view.price * 0.9, invested_krw=100_000)
-    assert strat.plan(view, pos, _Ctx()) == []
+    # 추적 손절선 상향(set_stop)은 나올 수 있다 - 청산만 하지 않으면 된다
+    assert not any(a.kind == "sell_market" for a in strat.plan(view, pos, _Ctx()))
 
 
 def test_daily_trend_entry_sets_protective_stop():
@@ -498,7 +499,89 @@ def test_daily_trend_holds_when_above_ma_no_bear():
     view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
     pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
                    avg_price=view.price * 0.9, invested_krw=100_000)
-    assert strat.plan(view, pos, _Ctx()) == []
+    assert not any(a.kind == "sell_market" for a in strat.plan(view, pos, _Ctx()))
+
+
+# ---- 추적 손절(샹들리에) / 부분 익절 ---- #
+def test_daily_trend_trailing_stop_ratchets_up():
+    """보유 중 손절선은 샹들리에 출구까지 올라가야 한다."""
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=view.price * 0.9, invested_krw=100_000,
+                   stop_price=view.price * 0.5, init_stop=view.price * 0.5)
+    actions = strat.plan(view, pos, _Ctx())
+    stops = [a for a in actions if a.kind == "set_stop"]
+    assert stops, "샹들리에 출구가 기존 손절선보다 높으면 상향해야 한다"
+    assert stops[0].price > pos.stop_price
+
+
+def test_daily_trend_trailing_stop_never_lowers():
+    """이미 높은 손절선을 샹들리에가 끌어내리면 안 된다 (래칫)."""
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
+    high_stop = view.price * 0.995
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=view.price * 0.9, invested_krw=100_000,
+                   stop_price=high_stop, init_stop=view.price * 0.5)
+    for a in strat.plan(view, pos, _Ctx()):
+        if a.kind == "set_stop":
+            assert a.price >= high_stop
+
+
+def test_daily_trend_trailing_uses_position_high_not_market_high():
+    """
+    시장 22일 최고가를 기준으로 삼으면, 고점에서 밀린 종목에 이 로직을 처음 붙이는
+    순간 손절선이 현재가 위로 올라가 즉시 전량 청산된다. 진입 이후 고가(pos.highest)
+    기준이어야 기존 포지션에 안전하게 얹을 수 있다.
+    """
+    from core.indicators import atr as atr_fn
+
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
+    n, k = settings.chandelier_n, settings.chandelier_k
+    market_high = float(view.daily["high"].tail(n).max())
+    atr_now = float(atr_fn(view.daily, n).dropna().iloc[-1])
+
+    # 진입 이후 고가가 시장 고가보다 낮은 상황(= 고점에서 밀린 뒤 들어온 포지션)
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=view.price, invested_krw=100_000,
+                   stop_price=view.price * 0.9, init_stop=view.price * 0.9,
+                   highest=view.price)
+    assert pos.highest < market_high, "테스트 전제: 진입 이후 고가 < 시장 고가"
+
+    chandelier = strat._chandelier(view, pos)
+    market_based = market_high - k * atr_now
+    assert chandelier < market_based, "시장 고가 기준보다 낮은(= 더 여유 있는) 손절선이어야 한다"
+    assert chandelier < view.price, "추적 손절선이 현재가 위로 올라가면 즉시 청산된다"
+
+
+def test_daily_trend_partial_take_profit_at_r_multiple():
+    """+R 배수 도달 시 부분 익절하고 손절선을 본전 위로 올려야 한다."""
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
+    init_stop = view.price * 0.8
+    # 현재가가 평단 + 1.5R 을 넘도록 평단을 낮게 잡는다
+    avg = view.price / (1 + settings.trend_partial_tp_r * 0.2) * 0.98
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=avg, invested_krw=100_000,
+                   stop_price=init_stop, init_stop=avg * 0.8)
+    actions = strat.plan(view, pos, _Ctx())
+    partials = [a for a in actions if a.kind == "sell_market" and a.meta.get("partial")]
+    assert partials, "1.5R 도달 시 부분 익절이 나와야 한다"
+    assert 0 < partials[0].ratio < 1.0
+
+
+def test_daily_trend_stop_breach_beats_partial_take_profit():
+    """손절선을 이미 이탈했다면 부분 익절이 아니라 전량 청산이어야 한다."""
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
+    pos = Position(market="KRW-TEST", strategy="trend", volume=1.0,
+                   avg_price=view.price * 0.5, invested_krw=100_000,
+                   stop_price=view.price * 1.01, init_stop=view.price * 0.4)
+    actions = strat.plan(view, pos, _Ctx())
+    assert len(actions) == 1
+    assert actions[0].kind == "sell_market" and actions[0].ratio == 1.0
 
 
 # --------------------------------------------------------------------------- #

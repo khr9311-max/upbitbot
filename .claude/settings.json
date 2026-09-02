@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(ssh -i ~/.ssh/upbit-ec2-key.pem ubuntu@43.202.132.125:*)",
+      "Bash(ssh -i upbit-ec2-key.pem ubuntu@43.202.132.125:*)",
+      "Bash(ssh ubuntu@43.202.132.125:*)"
+    ]
+  }
+}
