@@ -62,10 +62,19 @@ class DailyTrendStrategy(Strategy):
         # 실측에서 방어 효과가 검증된 것은 _structural_bear() 규칙(EMA200 붕괴) 하나뿐이다.
         structural_bear = view.regime.regime == STRONG_BEAR and view.regime.source == "override"
 
+        daily_bar_date = str(view.daily.index[-1].date())
+
         if position and position.is_open:
-            return self._manage(view, position, close, ma, above_ma, structural_bear)
+            return self._manage(view, position, close, ma, above_ma, structural_bear, ctx, daily_bar_date)
 
         if structural_bear or not above_ma:
+            return []
+
+        # 당일 손절 쿨다운 - 손절선 부근에서 등락하면 청산 직후 같은 일봉으로 바로
+        # 재진입해 손절만 반복하는 휩쏘가 발생한다(실측: 백테스트에서 한 종목이
+        # 하루 안에 7회 왕복). 이 일봉(daily_bar_date)에 이미 손절이 있었다면
+        # 다음 일봉이 나올 때까지 재진입을 보류한다.
+        if ctx.state.trend_stop_cooldown.get(view.market) == daily_bar_date:
             return []
 
         # 진입 - 손절 기준은 일봉 ATR 이 아니라 MA 자체까지의 거리(추세 이탈 = 청산 조건이므로)
@@ -92,7 +101,7 @@ class DailyTrendStrategy(Strategy):
     # ------------------------------------------------------------------ #
     def _manage(
         self, view: MarketView, pos: Position, close: float, ma: float,
-        above_ma: bool, structural_bear: bool,
+        above_ma: bool, structural_bear: bool, ctx: Context, daily_bar_date: str,
     ) -> list[Action]:
         price = view.price
         pos.highest = max(pos.highest or pos.avg_price, price)
@@ -145,6 +154,7 @@ class DailyTrendStrategy(Strategy):
         # 4) 손절선 이탈 시 전량 청산 (부분 익절보다 우선한다)
         stop_line = max(new_stop, pos.stop_price)
         if stop_line > 0 and price <= stop_line:
+            ctx.state.trend_stop_cooldown[view.market] = daily_bar_date
             return [Action(kind=SELL_MARKET, market=view.market, ratio=1.0,
                            reason=f"일봉 추세 손절선 이탈 청산 (현재가 {price:,.0f} <= "
                                   f"손절선 {stop_line:,.0f})")]

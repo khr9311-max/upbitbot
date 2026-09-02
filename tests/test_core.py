@@ -572,6 +572,46 @@ def test_daily_trend_partial_take_profit_at_r_multiple():
     assert 0 < partials[0].ratio < 1.0
 
 
+def test_daily_trend_stop_cooldown_blocks_same_day_reentry():
+    """
+    손절선 이탈 청산 직후 같은 일봉 안에서는 재진입하면 안 된다 - 손절선 부근
+    등락으로 청산/재진입이 반복되는 휩쏘 방지(실측: 백테스트에서 한 종목이
+    하루 안에 7회 왕복 청산됨).
+    """
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name=STRONG_BULL)
+    ctx = _Ctx()
+    today = str(view.daily.index[-1].date())
+    ctx.state.trend_stop_cooldown[view.market] = today
+
+    actions = strat.plan(view, None, ctx)
+    assert actions == [], "같은 일봉에 손절 이력이 있으면 재진입을 보류해야 한다"
+
+
+def test_daily_trend_stop_breach_sets_cooldown():
+    """손절선 이탈 청산이 발생하면 그 일봉 날짜로 쿨다운을 기록해야 한다."""
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name="LOW_VOL_RANGE")
+    ctx = _Ctx()
+    pos = Position(market=view.market, strategy="trend", volume=1.0,
+                   avg_price=view.price * 0.5, invested_krw=100_000,
+                   stop_price=view.price * 1.01, init_stop=view.price * 0.4)
+    actions = strat.plan(view, pos, ctx)
+    assert any(a.kind == "sell_market" for a in actions)
+    assert ctx.state.trend_stop_cooldown.get(view.market) == str(view.daily.index[-1].date())
+
+
+def test_daily_trend_cooldown_clears_on_new_daily_bar():
+    """쿨다운은 그 날짜에만 적용된다 - 다른 날짜로 기록돼 있으면 재진입을 막지 않는다."""
+    strat = DailyTrendStrategy(settings)
+    view = _daily_view(drift=0.006, regime_name=STRONG_BULL)
+    ctx = _Ctx()
+    ctx.state.trend_stop_cooldown[view.market] = "2000-01-01"  # 오래된 날짜
+
+    actions = strat.plan(view, None, ctx)
+    assert any(a.kind == "buy_market" for a in actions), "다른(과거) 날짜의 쿨다운은 오늘 진입을 막으면 안 된다"
+
+
 def test_daily_trend_stop_breach_beats_partial_take_profit():
     """손절선을 이미 이탈했다면 부분 익절이 아니라 전량 청산이어야 한다."""
     strat = DailyTrendStrategy(settings)

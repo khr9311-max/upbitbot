@@ -119,6 +119,10 @@ class BotState:
     grid_cooldowns: dict[str, float] = field(default_factory=dict)
     # 이미 자본 기준선에 반영한 입출금 uuid (중복 반영 방지)
     seen_cash_flow_uuids: list[str] = field(default_factory=list)
+    # 일봉 추세 엔진 - market -> 마지막으로 손절선 이탈 청산이 일어난 일봉의 날짜(YYYY-MM-DD).
+    # 같은 날짜의 일봉이 유효한 동안은 재진입을 막아 손절선 부근 등락에 의한
+    # 당일 반복 진입/손절(휩쏘) 을 방지한다. 다음 날 새 일봉이 나오면 자연히 풀린다.
+    trend_stop_cooldown: dict[str, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
     # 직렬화
@@ -145,6 +149,7 @@ class BotState:
             "initial_equity": self.initial_equity,
             "grid_cooldowns": self.grid_cooldowns,
             "seen_cash_flow_uuids": self.seen_cash_flow_uuids[-2000:],
+            "trend_stop_cooldown": self.trend_stop_cooldown,
         }
 
     @classmethod
@@ -171,6 +176,7 @@ class BotState:
         st.initial_equity = float(raw.get("initial_equity", 0.0))
         st.grid_cooldowns = {k: float(v) for k, v in (raw.get("grid_cooldowns") or {}).items()}
         st.seen_cash_flow_uuids = list(raw.get("seen_cash_flow_uuids") or [])
+        st.trend_stop_cooldown = dict(raw.get("trend_stop_cooldown") or {})
         return st
 
     # ------------------------------------------------------------------ #
